@@ -1,19 +1,484 @@
 use std::io::{self, Write};
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
+use base64::Engine;
 
+use crate::config::{default_provider, load_user_config, resolve_provider};
+use crate::image::ImageGenerator;
+use crate::llm::{Message, OpenAIClient};
+use crate::project::{set_project_default, set_project_setting, Workspace};
 use crate::render::{divider, render_block, Block, BlockKind};
-use crate::session::ProjectLayout;
+use crate::runtime::{RunInput, Runtime};
+use crate::session::{load_events, load_history, ProjectLayout, Session};
 use crate::terminal::{Input, LineEditor};
+use crate::tools::{ToolEnv, ToolRegistry};
+
+#[derive(Debug, Clone)]
+pub struct AppOptions {
+    pub workdir: PathBuf,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub base_url: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub image_provider: Option<String>,
+    pub image_model: Option<String>,
+    pub image_base_url: Option<String>,
+    pub max_steps: usize,
+}
 
 pub struct App {
+    workspace: Workspace,
+    editor: LineEditor,
+    options: AppOptions,
+    resumed_from: Option<String>,
+    initial_history: Vec<Message>,
+    provider: String,
+    model: String,
+    base_url: String,
+    reasoning_effort: String,
+    image_provider: String,
+    image_model: String,
+    image_base_url: String,
+}
+
+pub struct DemoApp {
     layout: ProjectLayout,
     editor: LineEditor,
     width: usize,
 }
 
 impl App {
+    pub fn new(options: AppOptions, resumed_from: Option<String>) -> Result<Self> {
+        let workspace = Workspace::discover(&options.workdir)?;
+        let user_config = load_user_config()?;
+
+        let provider = first_non_empty([
+            options.provider.as_deref(),
+            Some(workspace.project.defaults.llm_provider.as_str()),
+            Some(user_config.defaults.llm_provider.as_str()),
+        ])
+        .unwrap_or_else(default_provider);
+        let model = first_non_empty([
+            options.model.as_deref(),
+            Some(workspace.project.defaults.llm_model.as_str()),
+            Some(user_config.defaults.llm_model.as_str()),
+        ])
+        .unwrap_or_default();
+        let reasoning_effort = first_non_empty([
+            options.reasoning_effort.as_deref(),
+            Some(workspace.project.settings.reasoning_effort.as_str()),
+            Some(user_config.defaults.reasoning_effort.as_str()),
+        ])
+        .unwrap_or_else(|| default_reasoning_effort(&provider, &model));
+        let image_provider = first_non_empty([
+            options.image_provider.as_deref(),
+            Some(workspace.project.defaults.image_provider.as_str()),
+            Some(user_config.defaults.image_provider.as_str()),
+        ])
+        .unwrap_or_default();
+        let image_model = first_non_empty([
+            options.image_model.as_deref(),
+            Some(workspace.project.defaults.image_model.as_str()),
+            Some(user_config.defaults.image_model.as_str()),
+        ])
+        .unwrap_or_default();
+
+        let provider_resolution =
+            resolve_provider(&workspace.root, &workspace.project, &user_config, &provider)?;
+        let base_url = options
+            .base_url
+            .clone()
+            .unwrap_or(provider_resolution.base_url);
+        let image_base_url = options.image_base_url.clone().unwrap_or_default();
+        let editor = LineEditor::new(workspace.state_dir().join("rust-tui-history.txt"))?;
+        let initial_history = if let Some(id) = &resumed_from {
+            load_history(&workspace.root, id).with_context(|| format!("resume {id}"))?
+        } else {
+            Vec::new()
+        };
+
+        Ok(Self {
+            workspace,
+            editor,
+            options,
+            resumed_from,
+            initial_history,
+            provider,
+            model,
+            base_url,
+            reasoning_effort,
+            image_provider,
+            image_model,
+            image_base_url,
+        })
+    }
+
+    pub fn run(mut self) -> Result<()> {
+        self.print_header()?;
+        let mut history = self.initial_history.clone();
+        let mut session = self.create_session("interactive REPL")?;
+        println!("session: {}", session.dir.display());
+        if !history.is_empty() {
+            println!("loaded {} prior messages", history.len());
+            render_history(&history);
+        }
+
+        loop {
+            match self.editor.read("> ")? {
+                Input::Line(line) => {
+                    let text = line.trim();
+                    if text.is_empty() {
+                        continue;
+                    }
+                    if text.starts_with('/') {
+                        if self.handle_slash(text, &mut history, &session)? {
+                            break;
+                        }
+                        continue;
+                    }
+                    let result = self.run_turn(&mut session, text.to_string(), history)?;
+                    history = result;
+                }
+                Input::Interrupted => {
+                    println!("input cleared");
+                }
+                Input::Eof => break,
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn run_one_shot(self, prompt: String) -> Result<()> {
+        let history = self.initial_history.clone();
+        let mut session = self.create_session(&prompt.chars().take(80).collect::<String>())?;
+        let _ = self.run_turn(&mut session, prompt, history)?;
+        Ok(())
+    }
+
+    fn create_session(&self, intent: &str) -> Result<Session> {
+        Session::create(
+            &self.workspace.root,
+            &self.workspace.project.id,
+            intent,
+            self.resumed_from.as_deref(),
+        )
+    }
+
+    fn run_turn(
+        &self,
+        session: &mut Session,
+        prompt: String,
+        history: Vec<Message>,
+    ) -> Result<Vec<Message>> {
+        if self.provider == "anthropic" {
+            bail!("Rust runtime does not support Anthropic yet; use openai/openrouter for this branch");
+        }
+        let user_config = load_user_config()?;
+        let llm_res = resolve_provider(
+            &self.workspace.root,
+            &self.workspace.project,
+            &user_config,
+            &self.provider,
+        )?;
+        let llm = OpenAIClient::new(
+            &self.provider,
+            llm_res.api_key,
+            first_non_empty([
+                Some(self.base_url.as_str()),
+                Some(llm_res.base_url.as_str()),
+            ])
+            .unwrap_or_default(),
+            self.model.clone(),
+        )?;
+
+        session.set_runtime_info(llm.provider(), llm.model())?;
+        session.append_prompt("user", &prompt)?;
+
+        let image = self.build_image_generator(&user_config).ok();
+        let tool_env = ToolEnv {
+            workspace: self.workspace.clone(),
+            session_id: session.id.clone(),
+            session_dir: session.dir.clone(),
+            image,
+            bash_mode: effective_bash_mode(&self.workspace.project.settings.bash_permission_mode),
+        };
+        let registry = ToolRegistry::standard(&tool_env);
+        let system_prompt = build_project_system_prompt(&self.workspace, &registry.names());
+        let runtime = Runtime {
+            llm,
+            registry,
+            env: tool_env,
+            max_steps: self.options.max_steps,
+            reasoning_effort: self.reasoning_effort.clone(),
+        };
+
+        let history_len = history.len();
+        let result = runtime.run(RunInput {
+            system_prompt,
+            user_input: prompt,
+            history,
+        })?;
+        let delta = if history_len <= result.messages.len() {
+            &result.messages[history_len..]
+        } else {
+            result.messages.as_slice()
+        };
+        session.append_messages(delta)?;
+        session.write_summary(
+            &result.finish_summary,
+            &result.finish_artifacts,
+            result.finished,
+        )?;
+        println!("session: {}", session.dir.display());
+        Ok(result.messages)
+    }
+
+    fn build_image_generator(
+        &self,
+        user_config: &crate::config::UserConfig,
+    ) -> Result<ImageGenerator> {
+        if self.image_provider.trim().is_empty() || self.image_model.trim().is_empty() {
+            bail!("image generation is not configured");
+        }
+        let resolved = resolve_provider(
+            &self.workspace.root,
+            &self.workspace.project,
+            user_config,
+            &self.image_provider,
+        )?;
+        ImageGenerator::new(
+            &self.image_provider,
+            resolved.api_key,
+            first_non_empty([
+                Some(self.image_base_url.as_str()),
+                Some(resolved.base_url.as_str()),
+            ])
+            .unwrap_or_default(),
+            self.image_model.clone(),
+        )
+    }
+
+    fn print_header(&self) -> Result<()> {
+        println!(
+            "openmelon rust — project {} ({})",
+            self.workspace.project.name, self.workspace.project.id
+        );
+        println!("{}", divider(88));
+        println!("workdir: {}", self.workspace.root.display());
+        println!(
+            "model: {}:{} reasoning={}",
+            self.provider,
+            self.model,
+            empty_as_auto(&self.reasoning_effort)
+        );
+        if !self.image_model.is_empty() {
+            println!(
+                "image: {}:{}",
+                empty_as_none(&self.image_provider),
+                self.image_model
+            );
+        }
+        println!("outputs: {}", self.workspace.outputs_dir().display());
+        println!("type /help for commands, Ctrl-D to exit");
+        println!();
+        io::stdout().flush()?;
+        Ok(())
+    }
+
+    fn handle_slash(
+        &mut self,
+        text: &str,
+        history: &mut Vec<Message>,
+        session: &Session,
+    ) -> Result<bool> {
+        let parts = text.split_whitespace().collect::<Vec<_>>();
+        match parts.first().copied().unwrap_or_default() {
+            "/exit" | "/quit" | "/q" => Ok(true),
+            "/help" => {
+                println!("  /help       show commands");
+                println!("  /status     show project/model status");
+                println!("  /history    render current conversation history");
+                println!("  /clear      clear in-memory conversation history");
+                println!("  /session    print current session directory");
+                println!("  /save PATH  save current history as JSONL");
+                println!("  /copy       print OSC52 clipboard sequence for transcript");
+                println!("  /events     show recent session events");
+                println!("  /model ID   switch LLM model and persist project default");
+                println!("  /model-image off | [PROVIDER] MODEL");
+                println!("  /settings bash strict|auto|trusted");
+                println!("  /settings reasoning auto|medium|high|xhigh");
+                println!("  /exit       exit");
+                Ok(false)
+            }
+            "/status" => {
+                println!(
+                    "project: {} ({})",
+                    self.workspace.project.name, self.workspace.project.id
+                );
+                println!(
+                    "model: {}:{} reasoning={}",
+                    self.provider,
+                    self.model,
+                    empty_as_auto(&self.reasoning_effort)
+                );
+                println!("outputs: {}", self.workspace.outputs_dir().display());
+                Ok(false)
+            }
+            "/history" => {
+                render_history(history);
+                Ok(false)
+            }
+            "/clear" => {
+                history.clear();
+                println!("history cleared");
+                Ok(false)
+            }
+            "/session" => {
+                println!("{}", session.dir.display());
+                Ok(false)
+            }
+            "/save" => {
+                let Some(path) = parts.get(1) else {
+                    bail!("/save: usage /save <path>");
+                };
+                save_history_jsonl(history, path)?;
+                println!("saved {} messages -> {}", history.len(), path);
+                Ok(false)
+            }
+            "/copy" => {
+                let text = plain_transcript(history);
+                if text.trim().is_empty() {
+                    println!("nothing to copy");
+                } else {
+                    print_osc52(&text)?;
+                    println!("copied transcript ({} chars)", text.chars().count());
+                }
+                Ok(false)
+            }
+            "/events" => {
+                let events = load_events(&session.dir, 20)?;
+                if events.is_empty() {
+                    println!("(no events recorded yet)");
+                } else {
+                    for event in events {
+                        println!("{}", serde_json::to_string(&event)?);
+                    }
+                }
+                Ok(false)
+            }
+            "/model" => {
+                let Some(model) = parts.get(1) else {
+                    bail!("/model: usage /model <model-id>");
+                };
+                self.model = (*model).to_string();
+                set_project_default(&self.workspace.root, "llm_model", &self.model)?;
+                println!("model: {}:{}", self.provider, self.model);
+                Ok(false)
+            }
+            "/model-image" => {
+                if parts.get(1).is_none() {
+                    bail!("/model-image: usage /model-image off | [provider] <model-id>");
+                }
+                if matches!(parts.get(1), Some(&"off" | &"disable" | &"none")) {
+                    self.image_provider.clear();
+                    self.image_model.clear();
+                    set_project_default(&self.workspace.root, "image_provider", "")?;
+                    set_project_default(&self.workspace.root, "image_model", "")?;
+                    println!("image generation disabled");
+                    return Ok(false);
+                }
+                let (provider, model) = if parts.len() >= 3 {
+                    (parts[1], parts[2])
+                } else {
+                    (
+                        if self.image_provider.is_empty() {
+                            self.provider.as_str()
+                        } else {
+                            self.image_provider.as_str()
+                        },
+                        parts[1],
+                    )
+                };
+                self.image_provider = provider.to_string();
+                self.image_model = model.to_string();
+                set_project_default(&self.workspace.root, "image_provider", &self.image_provider)?;
+                set_project_default(&self.workspace.root, "image_model", &self.image_model)?;
+                println!("image model: {}:{}", self.image_provider, self.image_model);
+                Ok(false)
+            }
+            "/settings" => {
+                self.handle_settings(&parts)?;
+                Ok(false)
+            }
+            other => {
+                println!(
+                    "{}",
+                    render_block(
+                        &Block {
+                            kind: BlockKind::Error,
+                            body: format!("unknown command: {other}"),
+                        },
+                        88,
+                    )
+                );
+                Ok(false)
+            }
+        }
+    }
+
+    fn handle_settings(&mut self, parts: &[&str]) -> Result<()> {
+        if parts.len() == 1 {
+            println!(
+                "bash_permission_mode: {}",
+                effective_bash_mode(&self.workspace.project.settings.bash_permission_mode)
+            );
+            println!(
+                "reasoning_effort: {}",
+                empty_as_auto(&self.reasoning_effort)
+            );
+            return Ok(());
+        }
+        match parts.get(1).copied() {
+            Some("bash") => {
+                let Some(mode) = parts.get(2).copied() else {
+                    bail!("/settings bash: expected strict|auto|trusted");
+                };
+                if !matches!(mode, "strict" | "auto" | "trusted") {
+                    bail!("/settings bash: expected strict|auto|trusted");
+                }
+                set_project_setting(&self.workspace.root, "bash_permission_mode", mode)?;
+                self.workspace.project.settings.bash_permission_mode = mode.to_string();
+                println!("bash_permission_mode: {mode}");
+            }
+            Some("reasoning") => {
+                let Some(effort) = parts.get(2).copied() else {
+                    bail!("/settings reasoning: expected auto|medium|high|xhigh");
+                };
+                if effort == "auto" {
+                    set_project_setting(&self.workspace.root, "reasoning_effort", "")?;
+                    self.reasoning_effort = default_reasoning_effort(&self.provider, &self.model);
+                    println!(
+                        "reasoning_effort: {}",
+                        empty_as_auto(&self.reasoning_effort)
+                    );
+                } else {
+                    if !matches!(effort, "medium" | "high" | "xhigh") {
+                        bail!("/settings reasoning: expected auto|medium|high|xhigh");
+                    }
+                    set_project_setting(&self.workspace.root, "reasoning_effort", effort)?;
+                    self.reasoning_effort = effort.to_string();
+                    println!("reasoning_effort: {}", self.reasoning_effort);
+                }
+            }
+            _ => bail!("/settings: expected bash or reasoning"),
+        }
+        Ok(())
+    }
+}
+
+impl DemoApp {
     pub fn new(workdir: PathBuf) -> Result<Self> {
         let layout = ProjectLayout::discover(workdir)?;
         let editor = LineEditor::new(layout.history_file())?;
@@ -26,7 +491,7 @@ impl App {
         })
     }
 
-    pub fn run(mut self) -> Result<()> {
+    pub fn run_demo(mut self) -> Result<()> {
         self.print_header()?;
 
         loop {
@@ -58,7 +523,7 @@ impl App {
     }
 
     fn print_header(&self) -> Result<()> {
-        println!("openmelon rust tui");
+        println!("openmelon rust tui demo");
         println!("{}", divider(self.width));
         println!("project: {}", self.layout.root().display());
         println!("outputs: {}", self.layout.outputs_dir().display());
@@ -69,7 +534,7 @@ impl App {
     }
 
     fn print_help(&self) -> Result<()> {
-        self.print_block(BlockKind::Assistant, HELP)
+        self.print_block(BlockKind::Assistant, DEMO_HELP)
     }
 
     fn print_status(&self) -> Result<()> {
@@ -126,7 +591,13 @@ impl App {
     }
 }
 
-const HELP: &str = r#"# Commands
+impl App {
+    pub fn new_demo(workdir: PathBuf) -> Result<DemoApp> {
+        DemoApp::new(workdir)
+    }
+}
+
+const DEMO_HELP: &str = r#"# Commands
 
 - `/help` shows this help.
 - `/status` prints project paths and current prototype mode.
@@ -134,7 +605,132 @@ const HELP: &str = r#"# Commands
 - `/error` prints an error block demo.
 - `/quit` exits the demo.
 
-This crate is the first Rust TUI slice. It deliberately keeps output in normal terminal scrollback so native copy, scroll, and resize behavior stay predictable."#;
+This crate keeps output in normal terminal scrollback so native copy, scroll, and resize behavior stay predictable."#;
+
+fn build_project_system_prompt(workspace: &Workspace, tool_names: &[String]) -> String {
+    let p = &workspace.project;
+    let mut out = String::new();
+    out.push_str(
+        "You are openmelon, a content-creation agent operating inside a creator's project.\n\n",
+    );
+    out.push_str(&format!("Project: {} ({})\n", p.name, p.id));
+    if !p.description.trim().is_empty() {
+        out.push_str(&format!("Description: {}\n", p.description));
+    }
+    if !p.persona.trim().is_empty() {
+        out.push_str(&format!("Voice / persona: {}\n", p.persona));
+    }
+    if !p.constraints.is_empty() {
+        out.push_str("House rules:\n");
+        for constraint in &p.constraints {
+            out.push_str(&format!("  - {}\n", constraint));
+        }
+    }
+    out.push_str("\nWork like a senior creator operating a durable creative workspace. Decide whether the request starts a new creative space, continues an existing space, modifies canon, records feedback, plans future content, or produces an episode. Load known spaces, characters, references, typography, layout rules, and reusable assets before production. Treat typography as descriptive continuity context and image prompt constraints, not a local font lookup. User-facing deliverables must be saved in visible project output directories such as outputs/; .openmelon is reserved for internal state, sessions, config, and continuity data. When done, call finish with a short summary and final artifact paths or updated continuity state.\n");
+    out.push_str("\nAvailable tools: ");
+    out.push_str(&tool_names.join(", "));
+    out.push('\n');
+    out
+}
+
+fn render_history(messages: &[Message]) {
+    for message in messages {
+        match message.role {
+            crate::llm::Role::System => {}
+            crate::llm::Role::User => println!("> {}", message.content),
+            crate::llm::Role::Assistant => {
+                if !message.content.trim().is_empty() {
+                    println!(
+                        "{}",
+                        render_block(
+                            &Block {
+                                kind: BlockKind::Assistant,
+                                body: message.content.clone(),
+                            },
+                            88,
+                        )
+                    );
+                }
+            }
+            crate::llm::Role::Tool => println!("  tool result: {}", message.content),
+        }
+    }
+}
+
+fn save_history_jsonl(history: &[Message], path: &str) -> Result<()> {
+    let mut file = std::fs::File::create(path)?;
+    for message in history {
+        serde_json::to_writer(&mut file, message)?;
+        file.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
+fn plain_transcript(history: &[Message]) -> String {
+    let mut out = String::new();
+    for message in history {
+        match message.role {
+            crate::llm::Role::System => {}
+            crate::llm::Role::User => out.push_str(&format!("User: {}\n\n", message.content)),
+            crate::llm::Role::Assistant => {
+                if !message.content.trim().is_empty() {
+                    out.push_str(&format!("Assistant: {}\n\n", message.content));
+                }
+            }
+            crate::llm::Role::Tool => out.push_str(&format!("Tool: {}\n\n", message.content)),
+        }
+    }
+    out
+}
+
+fn print_osc52(text: &str) -> Result<()> {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    eprint!("\x1b]52;c;{}\x07", encoded);
+    io::stderr().flush()?;
+    Ok(())
+}
+
+fn first_non_empty<'a>(values: impl IntoIterator<Item = Option<&'a str>>) -> Option<String> {
+    values
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn default_reasoning_effort(provider: &str, model: &str) -> String {
+    let p = provider.to_ascii_lowercase();
+    let m = model.to_ascii_lowercase();
+    if (p == "openai" || p == "openrouter") && (m.starts_with("gpt-5") || m.contains("/gpt-5")) {
+        "xhigh".to_string()
+    } else {
+        String::new()
+    }
+}
+
+fn effective_bash_mode(value: &str) -> String {
+    match value {
+        "auto" | "trusted" => value.to_string(),
+        _ => "strict".to_string(),
+    }
+}
+
+fn empty_as_auto(value: &str) -> &str {
+    if value.is_empty() {
+        "auto"
+    } else {
+        value
+    }
+}
+
+fn empty_as_none(value: &str) -> &str {
+    if value.is_empty() {
+        "none"
+    } else {
+        value
+    }
+}
 
 fn terminal_width() -> usize {
     std::env::var("COLUMNS")
