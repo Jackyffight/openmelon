@@ -30,6 +30,7 @@ coverage.html
 # Build
 /bin/
 /dist/
+/rust/target/
 
 # Spec / planning artifacts
 /specs/
