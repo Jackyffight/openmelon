@@ -2,7 +2,8 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 
 use crate::llm::{ChatRequest, FinishReason, Message, OpenAIClient, Role, ToolCall, Usage};
-use crate::render::{render_block, Block, BlockKind};
+use crate::render::{render_block, Block, BlockKind, MarkdownStream};
+use crate::session::Session;
 use crate::tools::{ToolEnv, ToolRegistry};
 
 pub struct Runtime {
@@ -28,7 +29,7 @@ pub struct RunResult {
 }
 
 impl Runtime {
-    pub fn run(&self, input: RunInput) -> Result<RunResult> {
+    pub fn run(&self, input: RunInput, session: &mut Session) -> Result<RunResult> {
         let mut messages = if input.history.is_empty() {
             let mut seeded = Vec::new();
             if !input.system_prompt.trim().is_empty() {
@@ -71,29 +72,63 @@ impl Runtime {
                 self.llm.provider(),
                 self.llm.model()
             );
+            session.append_event(
+                "turn_start",
+                serde_json::json!({
+                    "step": step + 1,
+                    "status": "started",
+                }),
+            )?;
 
+            let mut markdown = MarkdownStream::default();
             let response = self
                 .llm
-                .chat(ChatRequest {
-                    messages: messages.clone(),
-                    tools: self.registry.specs(),
-                    reasoning_effort: self.reasoning_effort.clone(),
-                })
+                .stream_chat(
+                    ChatRequest {
+                        messages: messages.clone(),
+                        tools: self.registry.specs(),
+                        reasoning_effort: self.reasoning_effort.clone(),
+                    },
+                    |delta| {
+                        let rendered = markdown.push(delta);
+                        if !rendered.is_empty() {
+                            print!("{rendered}");
+                            let _ = std::io::Write::flush(&mut std::io::stdout());
+                        }
+                    },
+                )
                 .with_context(|| format!("runtime chat step {}", step + 1))?;
 
             if !response.message.content.trim().is_empty() {
-                println!(
-                    "{}",
-                    render_block(
-                        &Block {
-                            kind: BlockKind::Assistant,
-                            body: response.message.content.clone(),
-                        },
-                        88,
-                    )
-                );
+                let tail = markdown.flush();
+                if !tail.is_empty() {
+                    println!("{tail}");
+                } else {
+                    println!();
+                }
+            }
+
+            if !response.message.content.trim().is_empty() {
+                // Streamed text already reached stdout. We do not reprint it,
+                // but history/resume still uses the rendered Markdown path.
             }
             render_usage(response.usage);
+            session.append_event(
+                "turn_response",
+                serde_json::json!({
+                    "step": step + 1,
+                    "status": "received",
+                    "detail": {
+                        "finish": format!("{:?}", response.finish_reason),
+                        "tool_calls": response.message.tool_calls.len(),
+                        "usage": {
+                            "prompt_tokens": response.usage.prompt_tokens,
+                            "completion_tokens": response.usage.completion_tokens,
+                            "total_tokens": response.usage.total_tokens,
+                        }
+                    }
+                }),
+            )?;
 
             let tool_calls = response.message.tool_calls.clone();
             messages.push(response.message);
@@ -107,6 +142,15 @@ impl Runtime {
             }
 
             for call in tool_calls {
+                session.append_event(
+                    "tool_call",
+                    serde_json::json!({
+                        "step": step + 1,
+                        "tool": call.name,
+                        "status": "started",
+                        "detail": { "arguments": call.arguments },
+                    }),
+                )?;
                 println!(
                     "{}",
                     render_block(
@@ -134,11 +178,20 @@ impl Runtime {
                         render_block(
                             &Block {
                                 kind: BlockKind::Error,
-                                body: err,
+                                body: err.clone(),
                             },
                             88,
                         )
                     );
+                    session.append_event(
+                        "tool_result",
+                        serde_json::json!({
+                            "step": step + 1,
+                            "tool": call.name,
+                            "status": "error",
+                            "detail": { "error": err },
+                        }),
+                    )?;
                 } else if call.name == "finish" {
                     if let Some(summary) = content.get("summary").and_then(Value::as_str) {
                         result.finish_summary = summary.to_string();
@@ -159,8 +212,26 @@ impl Runtime {
                             88,
                         )
                     );
+                    session.append_event(
+                        "tool_result",
+                        serde_json::json!({
+                            "step": step + 1,
+                            "tool": call.name,
+                            "status": "ok",
+                            "detail": content,
+                        }),
+                    )?;
                 } else {
                     println!("  {}", summarize_tool_result(&call, &content));
+                    session.append_event(
+                        "tool_result",
+                        serde_json::json!({
+                            "step": step + 1,
+                            "tool": call.name,
+                            "status": if content.get("error").is_some() { "error" } else { "ok" },
+                            "detail": content,
+                        }),
+                    )?;
                 }
 
                 messages.push(Message {

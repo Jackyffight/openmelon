@@ -1,8 +1,9 @@
 # Rust TUI Rewrite
 
-This branch starts the Rust rewrite without replacing the current Go CLI yet.
-The first goal is to lock down the terminal interaction contract before runtime
-parity work begins.
+This branch carries the Rust rewrite without replacing the current Go CLI yet.
+The goal is no longer a throwaway prototype: the Rust binary must preserve the
+same project/session/tool protocol while moving the interactive surface to a
+normal terminal-scrollback architecture.
 
 ## Direction
 
@@ -37,15 +38,22 @@ The Rust binary now provides:
 - visible creator output root at `outputs/`;
 - readline-backed input history;
 - normal-scrollback transcript output;
-- simple Markdown block rendering that leaves line reflow to the terminal;
-- status/help/history commands for local iteration;
-- OpenAI/OpenRouter-compatible chat completions with tool calls;
+- Markdown block rendering for history/resume and line-buffered Markdown
+  rendering for streamed assistant text;
+- status/help/history/session/events/copy/settings/model/model-image/skill/
+  space/compact slash commands for local iteration;
+- OpenAI/OpenRouter-compatible streaming chat completions with tool calls;
 - `reasoning_effort` forwarding for GPT-5-family models;
+- OpenAI-compatible request headers, including `openmelon-tui/<version>` user
+  agent and OpenRouter `HTTP-Referer`/`X-Title`;
 - project/global config and credentials resolution compatible with the Go CLI;
 - session creation/resume using the same `.openmelon/sessions/<id>/`
   `meta.json`, `messages.jsonl`, and `summary.json` layout;
+- session lifecycle events for turn starts, model responses, tool calls, and
+  tool results;
 - core tools for project inspection, file reads, search, visible artifact
-  saves, guarded shell inspection, image generation, and `finish`.
+  saves, Skill-Plus compilation, guarded shell execution, image generation,
+  and `finish`.
 - creator continuity tools for planning, space creation/activation,
   decisions, feedback, provisional memory, episodes, reusable assets, and
   compaction records.
@@ -72,23 +80,28 @@ The Rust runtime reads the same project defaults:
 
 ## Migration Plan
 
-1. Stabilize the Rust TUI contract.
-2. Add transcript block types for assistant text, reasoning summaries, tool
-   calls, permission prompts, errors, and creator workflow checkpoints.
-3. Port session loading and resume rendering into Rust.
-4. Port the Go runtime behavior behind a Rust event model, keeping the disk
-   protocol compatible while the entrypoint is separate.
-5. Replace the Go TUI entrypoint only after resize, copy, history, interrupt,
-   Markdown, and permission behavior match the target experience.
+1. Keep the Go entrypoint as production while Rust runs as an explicit binary.
+2. Verify Rust parity against real creator projects: resume, long output,
+   image generation, Skill-Plus, shell approval, and continuity reuse.
+3. Harden the readline surface: multiline editing, Ctrl-C semantics, slash
+   completion, and history behavior must match the expected Codex/Claude-like
+   feel.
+4. Port any remaining Go-only onboarding/setup commands or make the Rust
+   binary call into the same project config files without drift.
+5. Replace the Go TUI entrypoint only after copy, scroll, resize, Markdown,
+   permission, model switching, output placement, and creator workflow parity
+   are verified in daily use.
 
 ## Remaining Gaps
 
-- Anthropic native requests are not ported yet.
-- Bash approvals are conservative: trusted mode runs commands, strict mode
-  auto-allows only read-only inspection commands.
-- Slash command parity is not complete yet (`/model`, `/model-image`,
-  `/settings`, `/copy`, `/events`, `/space`, `/compact`, `/skill` still need
-  Rust implementations).
-- Streaming SSE text/tool-call rendering is not ported yet; Rust currently uses
-  non-streaming chat completions.
-- The Go `openmelon` executable is still the production entrypoint.
+- Anthropic native tool calling is not ported. This mirrors the current Go
+  interactive agent constraint: use OpenAI/OpenRouter-compatible providers for
+  tool-calling sessions.
+- Bash approval is interactive and supports yes/always/no, but the Rust branch
+  does not yet have the Go TUI modal or LLM safety judge.
+- The Rust input layer uses `rustyline`, not the full Go Bubble Tea visual
+  prompt. It gives native editing/history/IME behavior, but slash completion
+  and pending-input behavior still need the final Codex/Claude-like polish.
+- Onboarding/setup/install commands remain in the Go CLI.
+- The Go `openmelon` executable is still the production entrypoint until this
+  branch is promoted.

@@ -1,5 +1,7 @@
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::process::Command;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
 use base64::Engine;
@@ -40,6 +42,8 @@ pub struct App {
     image_provider: String,
     image_model: String,
     image_base_url: String,
+    active_skill: String,
+    allowed_bash: Arc<Mutex<std::collections::BTreeSet<String>>>,
 }
 
 pub struct DemoApp {
@@ -53,12 +57,15 @@ impl App {
         let workspace = Workspace::discover(&options.workdir)?;
         let user_config = load_user_config()?;
 
-        let provider = first_non_empty([
+        let mut provider = first_non_empty([
             options.provider.as_deref(),
             Some(workspace.project.defaults.llm_provider.as_str()),
             Some(user_config.defaults.llm_provider.as_str()),
         ])
         .unwrap_or_else(default_provider);
+        if provider == "auto" {
+            provider = default_provider();
+        }
         let model = first_non_empty([
             options.model.as_deref(),
             Some(workspace.project.defaults.llm_model.as_str()),
@@ -111,6 +118,8 @@ impl App {
             image_provider,
             image_model,
             image_base_url,
+            active_skill: String::new(),
+            allowed_bash: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
         })
     }
 
@@ -137,7 +146,8 @@ impl App {
                         }
                         continue;
                     }
-                    let result = self.run_turn(&mut session, text.to_string(), history)?;
+                    let user_text = self.apply_active_skill(text);
+                    let result = self.run_turn(&mut session, user_text, history)?;
                     history = result;
                 }
                 Input::Interrupted => {
@@ -203,9 +213,11 @@ impl App {
             session_dir: session.dir.clone(),
             image,
             bash_mode: effective_bash_mode(&self.workspace.project.settings.bash_permission_mode),
+            allowed_bash: self.allowed_bash.clone(),
         };
         let registry = ToolRegistry::standard(&tool_env);
         let system_prompt = build_project_system_prompt(&self.workspace, &registry.names());
+        self.print_context_status(&registry, &tool_env);
         let runtime = Runtime {
             llm,
             registry,
@@ -215,11 +227,14 @@ impl App {
         };
 
         let history_len = history.len();
-        let result = runtime.run(RunInput {
-            system_prompt,
-            user_input: prompt,
-            history,
-        })?;
+        let result = runtime.run(
+            RunInput {
+                system_prompt,
+                user_input: prompt,
+                history,
+            },
+            session,
+        )?;
         let delta = if history_len <= result.messages.len() {
             &result.messages[history_len..]
         } else {
@@ -309,6 +324,10 @@ impl App {
                 println!("  /model-image off | [PROVIDER] MODEL");
                 println!("  /settings bash strict|auto|trusted");
                 println!("  /settings reasoning auto|medium|high|xhigh");
+                println!("  /skill      list skills");
+                println!("  /skill ID   apply a skillplus package to the next message");
+                println!("  /space ID   show a creative space summary");
+                println!("  /compact ID print a compaction draft");
                 println!("  /exit       exit");
                 Ok(false)
             }
@@ -412,6 +431,18 @@ impl App {
                 self.handle_settings(&parts)?;
                 Ok(false)
             }
+            "/skill" => {
+                self.handle_skill(&parts)?;
+                Ok(false)
+            }
+            "/space" => {
+                self.print_space(&parts)?;
+                Ok(false)
+            }
+            "/compact" => {
+                self.print_compact(&parts)?;
+                Ok(false)
+            }
             other => {
                 println!(
                     "{}",
@@ -426,6 +457,122 @@ impl App {
                 Ok(false)
             }
         }
+    }
+
+    fn apply_active_skill(&mut self, text: &str) -> String {
+        if self.active_skill.is_empty() {
+            return text.to_string();
+        }
+        let skill = std::mem::take(&mut self.active_skill);
+        format!(
+            "Apply the skill {skill:?} to this request: first call compile_skill with skill={skill:?} (BARE slug, no 'skillplus:' prefix) to fetch the package's prompt + output schema, then proceed.\n\n{text}"
+        )
+    }
+
+    fn handle_skill(&mut self, parts: &[&str]) -> Result<()> {
+        if parts.len() == 1 {
+            let skills = list_skillplus()?;
+            if skills.is_empty() {
+                println!("(no skillplus packages found)");
+            } else {
+                for skill in skills {
+                    println!(
+                        "  {}  {}",
+                        skill
+                            .get("id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("<unknown>"),
+                        skill
+                            .get("description")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("")
+                    );
+                }
+            }
+            println!("usage: /skill <id> or /skill clear");
+            return Ok(());
+        }
+        let arg = parts[1];
+        if matches!(arg, "clear" | "off" | "none") {
+            self.active_skill.clear();
+            println!("skill cleared");
+            return Ok(());
+        }
+        self.active_skill = arg.to_string();
+        println!("skill: {} applies to your next message", self.active_skill);
+        Ok(())
+    }
+
+    fn print_space(&self, parts: &[&str]) -> Result<()> {
+        let Some(space_id) = parts.get(1) else {
+            bail!("/space: usage /space <id>");
+        };
+        let tool_env = self.tool_env(None, "");
+        let packet = ToolRegistry::standard(&tool_env).dispatch(
+            &tool_env,
+            "get_context_packet",
+            serde_json::json!({ "space_id": space_id }),
+        )?;
+        if let Some(err) = packet.get("error").and_then(serde_json::Value::as_str) {
+            bail!("/space: {err}");
+        }
+        let space = packet.get("space").cloned().unwrap_or_default();
+        println!(
+            "{} ({}) {}",
+            space
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(*space_id),
+            space
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown"),
+            space
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+        );
+        println!(
+            "  {} decisions · {} feedback · {} episodes · {} assets",
+            packet
+                .get("recent_decisions")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0),
+            packet
+                .get("recent_feedback")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0),
+            packet
+                .get("recent_episodes")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0),
+            packet
+                .get("assets")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0)
+        );
+        Ok(())
+    }
+
+    fn print_compact(&self, parts: &[&str]) -> Result<()> {
+        let Some(space_id) = parts.get(1) else {
+            bail!("/compact: usage /compact <space-id>");
+        };
+        let tool_env = self.tool_env(None, "");
+        let packet = ToolRegistry::standard(&tool_env).dispatch(
+            &tool_env,
+            "get_context_packet",
+            serde_json::json!({ "space_id": space_id }),
+        )?;
+        if let Some(err) = packet.get("error").and_then(serde_json::Value::as_str) {
+            bail!("/compact: {err}");
+        }
+        println!("{}", render_compaction_draft(&packet));
+        Ok(())
     }
 
     fn handle_settings(&mut self, parts: &[&str]) -> Result<()> {
@@ -475,6 +622,34 @@ impl App {
             _ => bail!("/settings: expected bash or reasoning"),
         }
         Ok(())
+    }
+
+    fn tool_env(&self, session: Option<&Session>, session_id: &str) -> ToolEnv {
+        ToolEnv {
+            workspace: self.workspace.clone(),
+            session_id: session
+                .map(|s| s.id.clone())
+                .unwrap_or_else(|| session_id.to_string()),
+            session_dir: session
+                .map(|s| s.dir.clone())
+                .unwrap_or_else(|| self.workspace.state_dir().join("sessions")),
+            image: None,
+            bash_mode: effective_bash_mode(&self.workspace.project.settings.bash_permission_mode),
+            allowed_bash: self.allowed_bash.clone(),
+        }
+    }
+
+    fn print_context_status(&self, registry: &ToolRegistry, env: &ToolEnv) {
+        let Ok(spaces) = registry.dispatch(env, "list_spaces", serde_json::json!({})) else {
+            return;
+        };
+        let Some(items) = spaces.as_array() else {
+            return;
+        };
+        if items.is_empty() {
+            return;
+        }
+        println!("continuity: {} creative spaces available", items.len());
     }
 }
 
@@ -651,6 +826,23 @@ fn render_history(messages: &[Message]) {
                         )
                     );
                 }
+                for call in &message.tool_calls {
+                    println!(
+                        "{}",
+                        render_block(
+                            &Block {
+                                kind: BlockKind::Tool,
+                                body: format!(
+                                    "tool {} {}",
+                                    call.name,
+                                    serde_json::to_string(&call.arguments)
+                                        .unwrap_or_else(|_| "{}".to_string())
+                                ),
+                            },
+                            88,
+                        )
+                    );
+                }
             }
             crate::llm::Role::Tool => println!("  tool result: {}", message.content),
         }
@@ -676,6 +868,13 @@ fn plain_transcript(history: &[Message]) -> String {
                 if !message.content.trim().is_empty() {
                     out.push_str(&format!("Assistant: {}\n\n", message.content));
                 }
+                for call in &message.tool_calls {
+                    out.push_str(&format!(
+                        "Tool call: {} {}\n\n",
+                        call.name,
+                        serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".to_string())
+                    ));
+                }
             }
             crate::llm::Role::Tool => out.push_str(&format!("Tool: {}\n\n", message.content)),
         }
@@ -683,11 +882,153 @@ fn plain_transcript(history: &[Message]) -> String {
     out
 }
 
+fn render_compaction_draft(packet: &serde_json::Value) -> String {
+    let space = packet.get("space").cloned().unwrap_or_default();
+    let name = space
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("Space");
+    let id = space
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let status = space
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let mut out = String::new();
+    out.push_str(&format!("# {name} Compaction\n\n"));
+    out.push_str(&format!("Space: {id} ({status})\n"));
+
+    let canon = packet
+        .get("canon")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if !canon.is_empty() {
+        out.push_str("\n## Canon\n");
+        out.push_str(canon);
+        out.push('\n');
+    }
+
+    push_compaction_rows(
+        &mut out,
+        "Confirmed Decisions",
+        packet.get("recent_decisions"),
+        |row| {
+            let decision = row
+                .get("decision")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let target = row
+                .get("target")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            if target.is_empty() {
+                decision.to_string()
+            } else {
+                format!("{decision} [{target}]")
+            }
+        },
+    );
+    push_compaction_rows(
+        &mut out,
+        "Feedback Signals",
+        packet.get("recent_feedback"),
+        |row| {
+            let signal = row
+                .get("signal")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let recommendation = row
+                .get("recommendation")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            if recommendation.is_empty() {
+                signal.to_string()
+            } else {
+                format!("{signal}: {recommendation}")
+            }
+        },
+    );
+    push_compaction_rows(&mut out, "Reusable Assets", packet.get("assets"), |row| {
+        let asset_id = row
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let status = row
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let weight = row
+            .get("weight")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0);
+        let description = row
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        format!("{asset_id} ({status}, weight {weight:.2}): {description}")
+    });
+    push_compaction_rows(
+        &mut out,
+        "Recent Episodes",
+        packet.get("recent_episodes"),
+        |row| {
+            let episode_id = row
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let topic = first_non_empty([
+                row.get("topic").and_then(serde_json::Value::as_str),
+                row.get("title").and_then(serde_json::Value::as_str),
+            ])
+            .unwrap_or_default();
+            format!("{episode_id}: {topic}")
+        },
+    );
+
+    out.trim().to_string()
+}
+
+fn push_compaction_rows(
+    out: &mut String,
+    title: &str,
+    rows: Option<&serde_json::Value>,
+    render: impl Fn(&serde_json::Value) -> String,
+) {
+    let Some(rows) = rows.and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    if rows.is_empty() {
+        return;
+    }
+    out.push_str(&format!("\n## {title}\n"));
+    for row in rows {
+        let text = render(row);
+        if !text.trim().is_empty() {
+            out.push_str(&format!("- {text}\n"));
+        }
+    }
+}
+
 fn print_osc52(text: &str) -> Result<()> {
     let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
     eprint!("\x1b]52;c;{}\x07", encoded);
     io::stderr().flush()?;
     Ok(())
+}
+
+fn list_skillplus() -> Result<Vec<serde_json::Value>> {
+    let output = Command::new("skillplus").arg("list").arg("--json").output();
+    let Ok(output) = output else {
+        return Ok(Vec::new());
+    };
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+    let skills = serde_json::from_slice(&output.stdout)?;
+    Ok(skills)
 }
 
 fn first_non_empty<'a>(values: impl IntoIterator<Item = Option<&'a str>>) -> Option<String> {

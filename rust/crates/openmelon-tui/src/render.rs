@@ -48,54 +48,78 @@ pub fn render_markdown(markdown: &str, _width: usize) -> String {
 
     for raw in markdown.lines() {
         let line = raw.trim_end();
-
-        if line.trim_start().starts_with("```") {
-            in_code = !in_code;
-            continue;
-        }
-
-        if in_code {
-            out.push_str(DIM);
-            out.push_str(&render_prefixed(line, "    "));
-            out.push_str(RESET);
+        if let Some(rendered) = render_markdown_line(line, &mut in_code) {
+            out.push_str(&rendered);
             out.push('\n');
-            continue;
         }
-
-        if line.is_empty() {
-            out.push('\n');
-            continue;
-        }
-
-        if let Some(title) = heading_text(line) {
-            out.push_str(BOLD);
-            out.push_str(&strip_inline_marks(title));
-            out.push_str(RESET);
-            out.push('\n');
-            continue;
-        }
-
-        if let Some(item) = list_item(line) {
-            out.push_str("- ");
-            out.push_str(&strip_inline_marks(item));
-            out.push('\n');
-            continue;
-        }
-
-        if let Some(quote) = line.strip_prefix("> ") {
-            out.push_str(DIM);
-            out.push_str("> ");
-            out.push_str(&strip_inline_marks(quote));
-            out.push_str(RESET);
-            out.push('\n');
-            continue;
-        }
-
-        out.push_str(&strip_inline_marks(line));
-        out.push('\n');
     }
 
     out.trim_end().to_string()
+}
+
+#[derive(Debug, Default)]
+pub struct MarkdownStream {
+    line: String,
+    in_code: bool,
+}
+
+impl MarkdownStream {
+    pub fn push(&mut self, delta: &str) -> String {
+        let mut out = String::new();
+        for ch in delta.chars() {
+            if ch == '\n' {
+                if let Some(rendered) =
+                    render_markdown_line(self.line.trim_end(), &mut self.in_code)
+                {
+                    out.push_str(&rendered);
+                    out.push('\n');
+                }
+                self.line.clear();
+            } else {
+                self.line.push(ch);
+            }
+        }
+        out
+    }
+
+    pub fn flush(&mut self) -> String {
+        if self.line.is_empty() {
+            return String::new();
+        }
+        let rendered =
+            render_markdown_line(self.line.trim_end(), &mut self.in_code).unwrap_or_default();
+        self.line.clear();
+        rendered
+    }
+}
+
+fn render_markdown_line(line: &str, in_code: &mut bool) -> Option<String> {
+    if line.trim_start().starts_with("```") {
+        *in_code = !*in_code;
+        return None;
+    }
+
+    if *in_code {
+        return Some(format!("{DIM}{}{}", render_prefixed(line, "    "), RESET));
+    }
+
+    if line.is_empty() {
+        return Some(String::new());
+    }
+
+    if let Some(title) = heading_text(line) {
+        return Some(format!("{BOLD}{}{}", strip_inline_marks(title), RESET));
+    }
+
+    if let Some(item) = list_item(line) {
+        return Some(format!("- {}", strip_inline_marks(item)));
+    }
+
+    if let Some(quote) = line.strip_prefix("> ") {
+        return Some(format!("{DIM}> {}{}", strip_inline_marks(quote), RESET));
+    }
+
+    Some(strip_inline_marks(line))
 }
 
 fn render_prefixed(text: &str, prefix: &str) -> String {
@@ -151,5 +175,16 @@ mod tests {
 
         assert!(rendered.contains("* "));
         assert!(rendered.contains("tool output"));
+    }
+
+    #[test]
+    fn markdown_stream_renders_complete_lines() {
+        let mut stream = MarkdownStream::default();
+        let out = stream.push("# Title\n- one\npartial");
+
+        assert!(out.contains("Title"));
+        assert!(out.contains("- one"));
+        assert!(!out.contains("partial"));
+        assert_eq!(stream.flush(), "partial");
     }
 }

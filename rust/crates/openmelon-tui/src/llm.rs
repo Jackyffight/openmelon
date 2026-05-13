@@ -4,6 +4,8 @@ use anyhow::{bail, Context, Result};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
+use std::io::{BufRead, BufReader};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -112,11 +114,117 @@ impl OpenAIClient {
         &self.model
     }
 
-    pub fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
+    pub fn stream_chat(
+        &self,
+        request: ChatRequest,
+        mut on_text: impl FnMut(&str),
+    ) -> Result<ChatResponse> {
         if request.messages.is_empty() {
-            bail!("chat requires at least one message");
+            bail!("stream chat requires at least one message");
         }
 
+        let mut body = self.chat_body(&request);
+        body["stream"] = Value::Bool(true);
+        body["stream_options"] = serde_json::json!({ "include_usage": true });
+
+        let url = format!("{}/v1/chat/completions", self.base_url);
+        let mut req = self
+            .client
+            .post(url)
+            .bearer_auth(&self.api_key)
+            .header("content-type", "application/json")
+            .header("accept", "text/event-stream")
+            .header("user-agent", user_agent());
+        if self.provider == "openrouter" {
+            req = req
+                .header(
+                    "HTTP-Referer",
+                    "https://github.com/eight-acres-lab/openmelon",
+                )
+                .header("X-Title", "openmelon");
+        }
+
+        let resp = req.json(&body).send().context("send stream chat request")?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().unwrap_or_default();
+            bail!("llm[{}]: HTTP {}: {}", self.provider, status.as_u16(), text);
+        }
+
+        let mut text = String::new();
+        let mut tool_calls: BTreeMap<usize, PartialToolCall> = BTreeMap::new();
+        let mut finish_reason = FinishReason::Other;
+        let mut usage = Usage::default();
+
+        read_sse(resp, |event| {
+            if event.data == "[DONE]" {
+                return Ok(false);
+            }
+            let chunk: StreamChunkWire = serde_json::from_str(&event.data)
+                .with_context(|| format!("parse stream chunk: {}", event.data))?;
+            if let Some(u) = chunk.usage {
+                usage = u.into();
+            }
+            let Some(choice) = chunk.choices.into_iter().next() else {
+                return Ok(true);
+            };
+            if let Some(delta) = choice.delta.content {
+                if !delta.is_empty() {
+                    text.push_str(&delta);
+                    on_text(&delta);
+                }
+            }
+            for call in choice.delta.tool_calls.unwrap_or_default() {
+                let entry = tool_calls.entry(call.index).or_default();
+                if let Some(id) = call.id {
+                    if !id.is_empty() {
+                        entry.id = id;
+                    }
+                }
+                if let Some(function) = call.function {
+                    if let Some(name) = function.name {
+                        if !name.is_empty() {
+                            entry.name = name;
+                        }
+                    }
+                    if let Some(arguments) = function.arguments {
+                        entry.arguments.push_str(&arguments);
+                    }
+                }
+            }
+            if let Some(reason) = choice.finish_reason {
+                finish_reason = map_finish_reason(&reason);
+            }
+            Ok(true)
+        })?;
+
+        let calls = tool_calls
+            .into_values()
+            .map(|partial| ToolCall {
+                id: partial.id,
+                name: partial.name,
+                arguments: if partial.arguments.trim().is_empty() {
+                    serde_json::json!({})
+                } else {
+                    serde_json::from_str(&partial.arguments)
+                        .unwrap_or_else(|_| serde_json::json!({ "raw": partial.arguments }))
+                },
+            })
+            .collect();
+
+        Ok(ChatResponse {
+            message: Message {
+                role: Role::Assistant,
+                content: text,
+                tool_call_id: String::new(),
+                tool_calls: calls,
+            },
+            finish_reason,
+            usage,
+        })
+    }
+
+    fn chat_body(&self, request: &ChatRequest) -> Value {
         let wire_messages = request
             .messages
             .iter()
@@ -148,51 +256,16 @@ impl OpenAIClient {
         if let Some(effort) = normalize_reasoning_effort(&request.reasoning_effort) {
             body["reasoning_effort"] = Value::String(effort.to_string());
         }
-
-        let url = format!("{}/v1/chat/completions", self.base_url);
-        let mut req = self
-            .client
-            .post(url)
-            .bearer_auth(&self.api_key)
-            .header("content-type", "application/json")
-            .header("user-agent", user_agent());
-        if self.provider == "openrouter" {
-            req = req
-                .header(
-                    "HTTP-Referer",
-                    "https://github.com/eight-acres-lab/openmelon",
-                )
-                .header("X-Title", "openmelon");
-        }
-
-        let resp = req.json(&body).send().context("send chat request")?;
-        let status = resp.status();
-        let text = resp.text().context("read chat response")?;
-        if !status.is_success() {
-            bail!("llm[{}]: HTTP {}: {}", self.provider, status.as_u16(), text);
-        }
-        let parsed: ChatResponseWire =
-            serde_json::from_str(&text).with_context(|| format!("parse chat response: {text}"))?;
-        let choice = parsed
-            .choices
-            .into_iter()
-            .next()
-            .context("no choices in response")?;
-
-        Ok(ChatResponse {
-            message: from_wire_message(choice.message),
-            finish_reason: map_finish_reason(&choice.finish_reason),
-            usage: parsed.usage.unwrap_or_default().into(),
-        })
+        body
     }
 }
 
 fn user_agent() -> String {
     format!(
-        "openmelon-rust-tui/0.1.0 ({} {}; {})",
+        "openmelon-tui/{} ({}; {})",
+        env!("CARGO_PKG_VERSION"),
         std::env::consts::OS,
-        std::env::consts::ARCH,
-        std::env::var("TERM_PROGRAM").unwrap_or_else(|_| "terminal".to_string())
+        std::env::consts::ARCH
     )
 }
 
@@ -245,30 +318,6 @@ fn to_wire_message(message: &Message) -> Value {
     out
 }
 
-fn from_wire_message(wire: MessageWire) -> Message {
-    Message {
-        role: match wire.role.as_str() {
-            "system" => Role::System,
-            "user" => Role::User,
-            "tool" => Role::Tool,
-            _ => Role::Assistant,
-        },
-        content: wire.content.unwrap_or_default(),
-        tool_call_id: wire.tool_call_id.unwrap_or_default(),
-        tool_calls: wire
-            .tool_calls
-            .unwrap_or_default()
-            .into_iter()
-            .map(|call| ToolCall {
-                id: call.id,
-                name: call.function.name,
-                arguments: serde_json::from_str(&call.function.arguments)
-                    .unwrap_or_else(|_| serde_json::json!({ "raw": call.function.arguments })),
-            })
-            .collect(),
-    }
-}
-
 fn map_finish_reason(value: &str) -> FinishReason {
     match value {
         "stop" => FinishReason::Stop,
@@ -276,39 +325,6 @@ fn map_finish_reason(value: &str) -> FinishReason {
         "length" => FinishReason::Length,
         _ => FinishReason::Other,
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct ChatResponseWire {
-    choices: Vec<ChoiceWire>,
-    usage: Option<UsageWire>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChoiceWire {
-    message: MessageWire,
-    #[serde(default)]
-    finish_reason: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct MessageWire {
-    role: String,
-    content: Option<String>,
-    tool_calls: Option<Vec<ToolCallWire>>,
-    tool_call_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ToolCallWire {
-    id: String,
-    function: ToolCallFunctionWire,
-}
-
-#[derive(Debug, Deserialize)]
-struct ToolCallFunctionWire {
-    name: String,
-    arguments: String,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -319,6 +335,86 @@ struct UsageWire {
     completion_tokens: u64,
     #[serde(default)]
     total_tokens: u64,
+}
+
+#[derive(Debug, Default)]
+struct PartialToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+struct SseEvent {
+    data: String,
+}
+
+fn read_sse(
+    response: reqwest::blocking::Response,
+    mut on_event: impl FnMut(SseEvent) -> Result<bool>,
+) -> Result<()> {
+    let mut reader = BufReader::new(response);
+    let mut line = String::new();
+    let mut data = String::new();
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line)?;
+        if n == 0 {
+            if !data.is_empty() {
+                let _ = on_event(SseEvent { data })?;
+            }
+            return Ok(());
+        }
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            if !data.is_empty() {
+                let keep_going = on_event(SseEvent { data: data.clone() })?;
+                data.clear();
+                if !keep_going {
+                    return Ok(());
+                }
+            }
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("data:") {
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(rest.trim());
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamChunkWire {
+    #[serde(default)]
+    choices: Vec<StreamChoiceWire>,
+    usage: Option<UsageWire>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamChoiceWire {
+    #[serde(default)]
+    delta: StreamDeltaWire,
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct StreamDeltaWire {
+    content: Option<String>,
+    tool_calls: Option<Vec<StreamToolCallWire>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamToolCallWire {
+    index: usize,
+    id: Option<String>,
+    function: Option<StreamToolCallFunctionWire>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamToolCallFunctionWire {
+    name: Option<String>,
+    arguments: Option<String>,
 }
 
 impl From<UsageWire> for Usage {

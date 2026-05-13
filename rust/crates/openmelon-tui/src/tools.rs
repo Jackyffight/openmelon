@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -13,6 +14,7 @@ use crate::image::ImageGenerator;
 use crate::llm::Tool;
 use crate::project::{resolve_output_dir, Workspace};
 
+#[derive(Clone)]
 pub struct ToolRegistry {
     tools: Vec<ToolEntry>,
 }
@@ -23,8 +25,10 @@ pub struct ToolEnv {
     pub session_dir: PathBuf,
     pub image: Option<ImageGenerator>,
     pub bash_mode: String,
+    pub allowed_bash: std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>,
 }
 
+#[derive(Clone)]
 struct ToolEntry {
     spec: Tool,
     handler: fn(&ToolEnv, Value) -> Result<Value>,
@@ -52,6 +56,7 @@ impl ToolRegistry {
         registry.register(register_asset_tool());
         registry.register(update_asset_weight_tool());
         registry.register(record_compaction_tool());
+        registry.register(compile_skill_tool());
         registry.register(save_artifact_tool());
         registry.register(bash_tool());
         if env.image.is_some() {
@@ -401,6 +406,36 @@ fn record_compaction_tool() -> ToolEntry {
             }),
         ),
         handler: record_compaction,
+    }
+}
+
+fn compile_skill_tool() -> ToolEntry {
+    ToolEntry {
+        spec: tool(
+            "compile_skill",
+            "Compile a skillplus package and return its compiled prompt + output schema. Pass the BARE skill slug, not skillplus:<slug>.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "skill": {
+                        "type": "string",
+                        "description": "Bare skill slug, such as brand-logo, or an absolute path to a .skillplus directory. Do not prefix with skillplus:."
+                    },
+                    "locale": {
+                        "type": "string",
+                        "description": "Locale to compile for. Allowed: zh-CN or en. Default zh-CN.",
+                        "enum": ["zh-CN", "en"]
+                    },
+                    "model_profile": {
+                        "type": "string",
+                        "description": "Per-skill prompt overlay slug. Default gpt-image-family."
+                    },
+                    "vars": {"type": "object", "additionalProperties": {"type": "string"}}
+                },
+                "required": ["skill"]
+            }),
+        ),
+        handler: compile_skill,
     }
 }
 
@@ -1012,6 +1047,70 @@ fn append_space_jsonl(
     Ok(row)
 }
 
+fn compile_skill(_env: &ToolEnv, args: Value) -> Result<Value> {
+    let skill = normalize_skill_spec(&string_arg(&args, "skill"));
+    if skill.is_empty() {
+        return Ok(error_value("skill is required"));
+    }
+    let locale = normalize_locale(&string_arg(&args, "locale"));
+    let model_profile = first_non_empty_str(&[
+        string_arg(&args, "model_profile"),
+        "gpt-image-family".to_string(),
+    ]);
+
+    let mut cli_args = vec![
+        skill.clone(),
+        "--target".to_string(),
+        "openmelon".to_string(),
+        "--model-profile".to_string(),
+        model_profile.clone(),
+    ];
+    if !locale.is_empty() {
+        cli_args.push("--locale".to_string());
+        cli_args.push(locale.clone());
+    }
+    if let Some(vars) = args.get("vars").and_then(Value::as_object) {
+        for (key, value) in vars {
+            let rendered = value
+                .as_str()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| value.to_string());
+            cli_args.push("--var".to_string());
+            cli_args.push(format!("{key}={rendered}"));
+        }
+    }
+
+    match Command::new("skillplus").args(&cli_args).output() {
+        Ok(output) => return parse_skillplus_output(&skill, "skillplus", output),
+        Err(skillplus_err) if skillplus_err.kind() != io::ErrorKind::NotFound => {
+            return Ok(error_value(&format!(
+                "skillplus compile failed for {skill:?}: {skillplus_err}"
+            )));
+        }
+        Err(_) => {}
+    }
+
+    let python = std::env::var("OPENMELON_SKILLPLUS_PYTHON").unwrap_or_else(|_| "python3".into());
+    let mut py_args = vec!["-m".to_string(), "skillplus".to_string()];
+    py_args.extend(cli_args);
+    let mut cmd = Command::new(&python);
+    cmd.args(&py_args);
+    if let Ok(path) = std::env::var("OPENMELON_SKILLPLUS_PYTHONPATH") {
+        if !path.trim().is_empty() {
+            cmd.env("PYTHONPATH", path);
+        }
+    }
+    match cmd.output() {
+        Ok(output) => parse_skillplus_output(&skill, &format!("{python} -m skillplus"), output),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(error_value(&format!(
+            "skillplus: neither \"skillplus\" nor \"{python}\" is on PATH; install skillplus or set OPENMELON_SKILLPLUS_PYTHON/OPENMELON_SKILLPLUS_PYTHONPATH"
+        ))),
+        Err(err) => Ok(error_value(&format!(
+            "skillplus compile failed for {skill:?}: {err}"
+        ))),
+    }
+}
+
 fn generate_image(env: &ToolEnv, args: Value) -> Result<Value> {
     let Some(generator) = &env.image else {
         return Ok(error_value("image generation is not configured"));
@@ -1097,10 +1196,11 @@ fn bash(env: &ToolEnv, args: Value) -> Result<Value> {
     if command.trim().is_empty() {
         return Ok(error_value("command is required"));
     }
-    if env.bash_mode != "trusted" && !is_read_only_command(&command) {
-        return Ok(error_value(
-            "bash command requires interactive approval; Rust runtime currently auto-allows only read-only inspection commands unless bash_permission_mode is trusted",
-        ));
+    let description = string_arg(&args, "description");
+    let binary = first_binary(&command);
+    let approved_via = approve_bash(env, &command, &description, &binary)?;
+    if let Some(error) = approved_via.strip_prefix("error:") {
+        return Ok(error_value(error.trim()));
     }
     let timeout = args
         .get("timeout_seconds")
@@ -1117,7 +1217,7 @@ fn bash(env: &ToolEnv, args: Value) -> Result<Value> {
     Ok(serde_json::json!({
         "stdout": String::from_utf8_lossy(&output.stdout).to_string() + &String::from_utf8_lossy(&output.stderr),
         "exit_code": output.status.code().unwrap_or(-1),
-        "approved_via": if env.bash_mode == "trusted" { "trusted" } else { "read-only" },
+        "approved_via": approved_via,
         "timeout_seconds": Duration::from_secs_f64(timeout).as_secs(),
     }))
 }
@@ -1132,6 +1232,110 @@ fn string_arg(args: &Value, name: &str) -> String {
 
 fn error_value(message: &str) -> Value {
     serde_json::json!({ "error": message })
+}
+
+fn normalize_skill_spec(value: &str) -> String {
+    value
+        .trim()
+        .strip_prefix("skillplus:")
+        .unwrap_or(value.trim())
+        .strip_prefix("path:")
+        .unwrap_or_else(|| {
+            value
+                .trim()
+                .strip_prefix("skillplus:")
+                .unwrap_or(value.trim())
+        })
+        .trim()
+        .to_string()
+}
+
+fn normalize_locale(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "zh" | "zh-cn" | "zh_cn" | "chinese" | "cn" => "zh-CN".to_string(),
+        "en" | "en-us" | "english" | "us" => "en".to_string(),
+        _ => value.trim().to_string(),
+    }
+}
+
+fn parse_skillplus_output(skill: &str, via: &str, output: std::process::Output) -> Result<Value> {
+    if !output.status.success() {
+        let detail = first_non_empty_str(&[
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            String::from_utf8_lossy(&output.stdout).trim().to_string(),
+            format!("exit {}", output.status.code().unwrap_or(-1)),
+        ]);
+        return Ok(error_value(&format!(
+            "skillplus compile failed for {skill:?} via {via}: {detail}"
+        )));
+    }
+    let value: Value = match serde_json::from_slice(&output.stdout) {
+        Ok(value) => value,
+        Err(err) => {
+            return Ok(error_value(&format!(
+                "skillplus compiler output is not valid JSON: {err}"
+            )))
+        }
+    };
+    Ok(value)
+}
+
+fn approve_bash(env: &ToolEnv, command: &str, description: &str, binary: &str) -> Result<String> {
+    if env.bash_mode == "trusted" {
+        return Ok("trusted".to_string());
+    }
+    if !binary.is_empty()
+        && env
+            .allowed_bash
+            .lock()
+            .map(|allowed| allowed.contains(binary))
+            .unwrap_or(false)
+    {
+        return Ok("allowlisted".to_string());
+    }
+    if env.bash_mode == "auto" && is_read_only_command(command) {
+        return Ok("read-only".to_string());
+    }
+    if !io::stdin().is_terminal() {
+        return Ok(
+            "error:bash is unavailable: command needs approval but stdin is not interactive"
+                .to_string(),
+        );
+    }
+
+    render_approval_request(command, description, binary)?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => Ok("user-approved".to_string()),
+        "a" | "always" => {
+            if !binary.is_empty() {
+                let mut allowed = env
+                    .allowed_bash
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("bash allowlist lock poisoned"))?;
+                allowed.insert(binary.to_string());
+            }
+            Ok("user-approved".to_string())
+        }
+        _ => Ok("error:user denied execution".to_string()),
+    }
+}
+
+fn render_approval_request(command: &str, description: &str, binary: &str) -> Result<()> {
+    eprintln!();
+    eprintln!("Do you want to proceed?");
+    if !description.is_empty() {
+        eprintln!("  Reason:  {description}");
+    }
+    eprintln!("  Command: {command}");
+    if binary.is_empty() {
+        eprint!("Approve? [y]es / [N]o: ");
+    } else {
+        eprint!("Approve? [y]es / [a]lways allow {binary} this session / [N]o: ");
+    }
+    io::stderr().flush()?;
+    Ok(())
 }
 
 fn safe_join(root: &Path, rel: &str) -> Result<PathBuf> {
@@ -1295,6 +1499,25 @@ fn first_non_empty_str(values: &[String]) -> String {
         .to_string()
 }
 
+fn first_binary(command: &str) -> String {
+    for mut token in command.split_whitespace() {
+        if token.is_empty() {
+            continue;
+        }
+        if token.contains('=') && !token.contains('/') && !token.contains('\\') {
+            continue;
+        }
+        if matches!(token, "sudo" | "time" | "exec" | "nohup" | "env") {
+            continue;
+        }
+        if let Some(idx) = token.rfind(['/', '\\']) {
+            token = &token[idx + 1..];
+        }
+        return token.to_string();
+    }
+    String::new()
+}
+
 fn sha256_hex(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
@@ -1328,5 +1551,27 @@ mod tests {
     #[test]
     fn clean_label_normalizes_to_slug_like_text() {
         assert_eq!(clean_label("My Image 01"), "my-image-01");
+    }
+
+    #[test]
+    fn normalize_skill_spec_strips_legacy_prefixes() {
+        assert_eq!(normalize_skill_spec("skillplus:brand-logo"), "brand-logo");
+        assert_eq!(
+            normalize_skill_spec("path:/tmp/brand.skillplus"),
+            "/tmp/brand.skillplus"
+        );
+    }
+
+    #[test]
+    fn normalize_locale_accepts_common_aliases() {
+        assert_eq!(normalize_locale("zh"), "zh-CN");
+        assert_eq!(normalize_locale("EN-US"), "en");
+        assert_eq!(normalize_locale("fr"), "fr");
+    }
+
+    #[test]
+    fn first_binary_skips_common_shell_wrappers() {
+        assert_eq!(first_binary("FOO=bar env /usr/bin/rg hello"), "rg");
+        assert_eq!(first_binary("sudo time ls -la"), "ls");
     }
 }

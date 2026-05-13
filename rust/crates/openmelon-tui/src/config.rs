@@ -143,14 +143,14 @@ pub fn base_url_env(provider: &str) -> &'static str {
 }
 
 pub fn default_provider() -> String {
-    if env::var("ANTHROPIC_API_KEY").is_ok() {
-        return "anthropic".to_string();
-    }
     if env::var("OPENAI_API_KEY").is_ok() {
         return "openai".to_string();
     }
     if env::var("OPENROUTER_API_KEY").is_ok() {
         return "openrouter".to_string();
+    }
+    if env::var("ANTHROPIC_API_KEY").is_ok() {
+        return "anthropic".to_string();
     }
     "openai".to_string()
 }
