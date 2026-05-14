@@ -252,6 +252,18 @@ enum Overlay {
     Settings { cursor: usize },
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ScrollSnap {
+    Backward,
+    Forward,
+}
+
+#[derive(Debug, Clone)]
+struct TranscriptLine {
+    text: String,
+    block_start: bool,
+}
+
 impl TuiState {
     fn new(app: &App, session: &Session) -> Self {
         let (approval_tx, approval_rx) = mpsc::channel();
@@ -460,6 +472,7 @@ impl TuiState {
             self.scroll = max_scroll;
         } else {
             self.scroll = self.scroll.min(max_scroll);
+            self.scroll = snap_scroll_to_block_start(&transcript_lines, self.scroll);
         }
         let visible = transcript_lines
             .iter()
@@ -475,7 +488,7 @@ impl TuiState {
             out.push('\n');
         }
         for line in visible {
-            out.push_str(&fit_line(line, self.width));
+            out.push_str(&fit_line(&line.text, self.width));
             out.push('\n');
         }
         let used = pad_top
@@ -767,37 +780,47 @@ impl TuiState {
         lines
     }
 
-    fn transcript_lines(&self) -> Vec<String> {
+    fn transcript_lines(&self) -> Vec<TranscriptLine> {
         let mut out = Vec::new();
         for block in &self.transcript {
             match block {
                 TranscriptBlock::Raw(text) => {
-                    for line in text.lines() {
-                        out.extend(wrap_text_with_indent(line, self.width));
-                    }
                     if text.is_empty() {
-                        out.push(String::new());
+                        push_transcript_block(&mut out, vec![String::new()]);
+                    } else {
+                        let mut lines = Vec::new();
+                        for line in text.lines() {
+                            lines.extend(wrap_text_with_indent(line, self.width));
+                        }
+                        push_transcript_block(&mut out, lines);
                     }
                 }
                 TranscriptBlock::Markdown(text) => {
                     let rendered = render_markdown(text, self.width);
+                    let mut lines = Vec::new();
                     for line in rendered.lines() {
-                        out.extend(wrap_text_with_indent(&format!(" {line}"), self.width));
+                        lines.extend(wrap_text_with_indent(&format!(" {line}"), self.width));
                     }
+                    push_transcript_block(&mut out, lines);
                 }
                 TranscriptBlock::Rule(label) => {
-                    out.push(history_rule(label, self.width));
+                    push_transcript_block(&mut out, vec![history_rule(label, self.width)]);
                 }
                 TranscriptBlock::ToolCall { name, summary } => {
-                    out.extend(render_tool_call_lines(name, summary, self.width));
+                    push_transcript_block(
+                        &mut out,
+                        render_tool_call_lines(name, summary, self.width),
+                    );
                 }
             }
         }
         if !self.streaming.trim().is_empty() {
             let rendered = render_markdown(&self.streaming, self.width);
+            let mut lines = Vec::new();
             for line in rendered.lines() {
-                out.extend(wrap_text_with_indent(&format!(" {line}"), self.width));
+                lines.extend(wrap_text_with_indent(&format!(" {line}"), self.width));
             }
+            push_transcript_block(&mut out, lines);
         }
         out
     }
@@ -911,11 +934,13 @@ impl TuiState {
             Key::Down => self.history_next(),
             Key::PageUp => {
                 self.anchored_bottom = false;
-                self.scroll = self.scroll.saturating_sub((self.height / 2).max(1));
+                let target = self.scroll.saturating_sub((self.height / 2).max(1));
+                self.scroll = self.snap_scroll(target, ScrollSnap::Backward);
             }
             Key::PageDown => {
-                self.scroll = self.scroll.saturating_add((self.height / 2).max(1));
                 self.anchored_bottom = false;
+                let target = self.scroll.saturating_add((self.height / 2).max(1));
+                self.scroll = self.snap_scroll(target, ScrollSnap::Forward);
             }
             Key::Char(ch) => {
                 self.insert_char(ch);
@@ -1630,6 +1655,14 @@ impl TuiState {
             .map(char::len_utf8)
             .unwrap_or(0);
     }
+
+    fn snap_scroll(&self, target: usize, direction: ScrollSnap) -> usize {
+        let lines = self.transcript_lines();
+        match direction {
+            ScrollSnap::Backward => snap_scroll_to_block_start(&lines, target),
+            ScrollSnap::Forward => snap_scroll_to_next_block_start(&lines, target),
+        }
+    }
 }
 
 fn spawn_runtime(
@@ -2074,6 +2107,52 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
+}
+
+fn push_transcript_block(out: &mut Vec<TranscriptLine>, lines: Vec<String>) {
+    let mut wrote = false;
+    for line in lines {
+        out.push(TranscriptLine {
+            text: line,
+            block_start: !wrote,
+        });
+        wrote = true;
+    }
+    if !wrote {
+        out.push(TranscriptLine {
+            text: String::new(),
+            block_start: true,
+        });
+    }
+}
+
+fn snap_scroll_to_block_start(lines: &[TranscriptLine], mut index: usize) -> usize {
+    if lines.is_empty() {
+        return 0;
+    }
+    index = index.min(lines.len() - 1);
+    while index > 0 && !lines[index].block_start {
+        index -= 1;
+    }
+    index
+}
+
+fn snap_scroll_to_next_block_start(lines: &[TranscriptLine], mut index: usize) -> usize {
+    if lines.is_empty() {
+        return 0;
+    }
+    index = index.min(lines.len() - 1);
+    if lines[index].block_start {
+        return index;
+    }
+    while index + 1 < lines.len() && !lines[index].block_start {
+        index += 1;
+    }
+    if lines[index].block_start {
+        index
+    } else {
+        snap_scroll_to_block_start(lines, index)
+    }
 }
 
 fn wrap_text(text: &str, width: usize) -> Vec<String> {
