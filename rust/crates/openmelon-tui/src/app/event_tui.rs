@@ -27,6 +27,7 @@ const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
 const DIM: &str = "\x1b[2m";
 const RED: &str = "\x1b[31m";
+const GREEN: &str = "\x1b[32m";
 const CYAN: &str = "\x1b[36m";
 const CLEAR: &str = "\x1b[2J\x1b[H";
 const HIDE_CURSOR: &str = "\x1b[?25l";
@@ -460,18 +461,28 @@ impl TuiState {
         } else {
             self.scroll = self.scroll.min(max_scroll);
         }
-        for line in transcript_lines
+        let visible = transcript_lines
             .iter()
             .skip(self.scroll)
             .take(viewport_height)
-        {
+            .collect::<Vec<_>>();
+        let pad_top = if self.anchored_bottom && visible.len() < viewport_height {
+            viewport_height - visible.len()
+        } else {
+            0
+        };
+        for _ in 0..pad_top {
+            out.push('\n');
+        }
+        for line in visible {
             out.push_str(&fit_line(line, self.width));
             out.push('\n');
         }
-        let used = transcript_lines
-            .len()
-            .saturating_sub(self.scroll)
-            .min(viewport_height);
+        let used = pad_top
+            + transcript_lines
+                .len()
+                .saturating_sub(self.scroll)
+                .min(viewport_height);
         for _ in used..viewport_height {
             out.push('\n');
         }
@@ -493,7 +504,7 @@ impl TuiState {
 
     fn header_line(&self) -> String {
         let mut parts = vec![
-            format!("{BOLD}{CYAN}OpenMelon{RESET}"),
+            format!("{BOLD}openmelon{RESET}"),
             self.header_identity.clone(),
             format!("{}:{}", self.provider, self.model),
             format!("reasoning {}", empty_as_auto(&self.reasoning_effort)),
@@ -534,7 +545,7 @@ impl TuiState {
         if self.pending_count > 0 {
             left.push_str(&format!(" · {} pending", self.pending_count));
         }
-        let right = "Esc clear · Ctrl+C twice quit · PgUp/PgDn scroll";
+        let right = "esc clear · ctrl+c twice quit · pgup/pgdn scroll";
         vec![join_status_line(&left, right, self.width)]
     }
 
@@ -552,9 +563,9 @@ impl TuiState {
             .enumerate()
             .map(|(idx, (name, help))| {
                 if idx == self.palette_cursor {
-                    format!("{CYAN}› {name:<13}{RESET} {DIM}{help}{RESET}")
+                    format!("{CYAN}› {name}{RESET} {DIM}{help}{RESET}")
                 } else {
-                    format!("  {name:<13} {DIM}{help}{RESET}")
+                    format!("  {name} {DIM}{help}{RESET}")
                 }
             })
             .collect()
@@ -2112,7 +2123,7 @@ fn wrap_ansi(text: &str, width: usize, continuation: &str) -> Vec<String> {
 }
 
 fn render_tool_call_lines(name: &str, summary: &str, width: usize) -> Vec<String> {
-    let prefix = format!("\x1b[32m●\x1b[0m \x1b[1m{name}\x1b[0m");
+    let prefix = format!("{GREEN}●{RESET} {BOLD}{name}{RESET}");
     let prefix_width = display_width(&prefix);
     let mut lines = Vec::new();
     if summary.trim().is_empty() {
@@ -2120,14 +2131,67 @@ fn render_tool_call_lines(name: &str, summary: &str, width: usize) -> Vec<String
         return lines;
     }
     let gap = "  ";
-    let available = width.saturating_sub(prefix_width + gap.len()).max(12);
-    let summary_lines = wrap_ansi(summary, available, "");
+    let available = width.saturating_sub(prefix_width + gap.len()).max(24);
+    let summary_lines = wrap_summary(summary, available);
     for (idx, line) in summary_lines.into_iter().enumerate() {
         if idx == 0 {
             lines.push(format!("{prefix}{gap}{DIM}{line}{RESET}"));
         } else {
             lines.push(format!("  {DIM}{line}{RESET}"));
         }
+    }
+    lines
+}
+
+fn wrap_summary(summary: &str, width: usize) -> Vec<String> {
+    let clean = summary.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in clean.split(' ') {
+        let word_width = display_width(word);
+        if word_width > width {
+            if !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+            }
+            lines.extend(split_visible(word, width));
+            continue;
+        }
+        let current_width = display_width(&current);
+        if current.is_empty() {
+            current.push_str(word);
+        } else if current_width + 1 + word_width <= width {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            lines.push(std::mem::take(&mut current));
+            current.push_str(word);
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+fn split_visible(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut col = 0usize;
+    for ch in text.chars() {
+        let w = ch.width().unwrap_or(0);
+        if col > 0 && col + w > width {
+            lines.push(std::mem::take(&mut current));
+            col = 0;
+        }
+        current.push(ch);
+        col += w;
+    }
+    if !current.is_empty() {
+        lines.push(current);
     }
     lines
 }
@@ -2142,9 +2206,11 @@ fn leading_indent(text: &str) -> String {
 fn fit_line(line: &str, width: usize) -> String {
     let mut out = String::new();
     let mut col = 0usize;
+    let mut saw_ansi = false;
     let mut chars = line.chars().peekable();
     while let Some(ch) = chars.next() {
         if ch == '\x1b' {
+            saw_ansi = true;
             out.push(ch);
             for next in chars.by_ref() {
                 out.push(next);
@@ -2160,6 +2226,9 @@ fn fit_line(line: &str, width: usize) -> String {
         }
         out.push(ch);
         col += w;
+    }
+    if saw_ansi && !out.ends_with(RESET) {
+        out.push_str(RESET);
     }
     if col < width {
         out.push_str(&" ".repeat(width - col));

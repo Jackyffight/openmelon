@@ -219,7 +219,7 @@ pub fn render_finish_result(content: &str, width: usize, mode: TranscriptMode) -
             out.push('\n');
         }
         for path in artifacts {
-            push_line(&mut out, &format!(" artifact: {path}"));
+            push_line(&mut out, &format!(" artifact: {}", short_path(&path)));
         }
     }
     out.trim_end().to_string()
@@ -838,7 +838,7 @@ mod tests {
         );
 
         assert!(rendered.contains(" Done with three images."));
-        assert!(rendered.contains(" artifact: /tmp/a.png"));
+        assert!(rendered.contains(" artifact: tmp/a.png"));
         assert!(!rendered.contains("tool finish"));
     }
 
