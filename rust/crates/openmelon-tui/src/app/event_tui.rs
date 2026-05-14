@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -439,13 +440,10 @@ impl TuiState {
     }
 
     fn render(&mut self, term: &mut TerminalGuard) -> Result<()> {
-        let mut out = String::new();
-        out.push_str(CLEAR);
-        out.push_str(HIDE_CURSOR);
+        let mut lines = Vec::with_capacity(self.height.max(1));
 
         let header = self.header_line();
-        out.push_str(&fit_line(&header, self.width));
-        out.push('\n');
+        lines.push(header);
 
         let overlay_lines = self.overlay_lines();
         let palette_lines = if matches!(self.overlay, Overlay::None) {
@@ -485,11 +483,10 @@ impl TuiState {
             0
         };
         for _ in 0..pad_top {
-            out.push('\n');
+            lines.push(String::new());
         }
         for line in visible {
-            out.push_str(&fit_line(&line.text, self.width));
-            out.push('\n');
+            lines.push(line.text.clone());
         }
         let used = pad_top
             + transcript_lines
@@ -497,7 +494,7 @@ impl TuiState {
                 .saturating_sub(self.scroll)
                 .min(viewport_height);
         for _ in used..viewport_height {
-            out.push('\n');
+            lines.push(String::new());
         }
         for line in palette_lines
             .iter()
@@ -506,8 +503,18 @@ impl TuiState {
             .chain(input_lines.iter())
             .chain(status_lines.iter())
         {
+            lines.push(line.clone());
+        }
+        lines.truncate(self.height.max(1));
+
+        let mut out = String::new();
+        out.push_str(CLEAR);
+        out.push_str(HIDE_CURSOR);
+        for (idx, line) in lines.iter().enumerate() {
             out.push_str(&fit_line(line, self.width));
-            out.push('\n');
+            if idx + 1 < lines.len() {
+                out.push('\n');
+            }
         }
         term.write_all(out.as_bytes())?;
         term.flush()?;
@@ -519,15 +526,11 @@ impl TuiState {
         let mut parts = vec![
             format!("{BOLD}openmelon{RESET}"),
             self.header_identity.clone(),
-            format!("{}:{}", self.provider, self.model),
-            format!("reasoning {}", empty_as_auto(&self.reasoning_effort)),
+            self.model.clone(),
+            empty_as_auto(&self.reasoning_effort).to_string(),
         ];
         if !self.image_model.is_empty() {
-            parts.push(format!(
-                "img {}:{}",
-                empty_as_none(&self.image_provider),
-                self.image_model
-            ));
+            parts.push(format!("img {}", empty_as_none(&self.image_model)));
         }
         if self.pending_count > 0 {
             parts.push(format!("{} pending", self.pending_count));
@@ -570,18 +573,22 @@ impl TuiState {
         if filtered.is_empty() {
             return vec![format!("{DIM}  (no matching commands){RESET}")];
         }
-        filtered
+        let items = filtered
             .into_iter()
             .take(8)
             .enumerate()
             .map(|(idx, (name, help))| {
                 if idx == self.palette_cursor {
-                    format!("{CYAN}› {name}{RESET} {DIM}{help}{RESET}")
+                    format!("{CYAN}› {BOLD}{name}{RESET} {DIM}{help}{RESET}")
                 } else {
-                    format!("  {name} {DIM}{help}{RESET}")
+                    format!("  {DIM}{name}{RESET}")
                 }
             })
-            .collect()
+            .collect::<Vec<_>>();
+        let mut lines = Vec::with_capacity(items.len() + 2);
+        lines.push(command_rule(self.width));
+        lines.extend(items);
+        lines
     }
 
     fn overlay_lines(&self) -> Vec<String> {
@@ -790,7 +797,8 @@ impl TuiState {
                     } else {
                         let mut lines = Vec::new();
                         for line in text.lines() {
-                            lines.extend(wrap_text_with_indent(line, self.width));
+                            let line = compact_artifact_display_line(line);
+                            lines.extend(wrap_text_with_indent(&line, self.width));
                         }
                         push_transcript_block(&mut out, lines);
                     }
@@ -1966,6 +1974,9 @@ fn push_text_keys(text: &str, keys: &mut Vec<Key>) -> usize {
 impl TerminalGuard {
     fn enter() -> Result<Self> {
         let fd = libc::STDIN_FILENO;
+        if unsafe { libc::isatty(fd) } != 1 {
+            bail!("openmelon-rust interactive mode requires a TTY; run it from a terminal, or use `openmelon-rust run <prompt>` / `openmelon-rust --help`");
+        }
         let mut original = unsafe { std::mem::zeroed::<libc::termios>() };
         if unsafe { libc::tcgetattr(fd, &mut original) } != 0 {
             return Err(io::Error::last_os_error()).context("tcgetattr");
@@ -2222,6 +2233,14 @@ fn render_tool_call_lines(name: &str, summary: &str, width: usize) -> Vec<String
     lines
 }
 
+fn command_rule(width: usize) -> String {
+    let width = width.clamp(28, 160);
+    format!(
+        "{DIM}{} commands{RESET}",
+        "─".repeat(width.saturating_sub(9))
+    )
+}
+
 fn wrap_summary(summary: &str, width: usize) -> Vec<String> {
     let clean = summary.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut lines = Vec::new();
@@ -2273,6 +2292,37 @@ fn split_visible(text: &str, width: usize) -> Vec<String> {
         lines.push(current);
     }
     lines
+}
+
+fn compact_artifact_display_line(line: &str) -> String {
+    let trimmed = line.trim_start();
+    let Some(path) = trimmed.strip_prefix("artifact: ") else {
+        return line.to_string();
+    };
+    let leading = &line[..line.len() - trimmed.len()];
+    format!("{leading}artifact: {}", short_display_path(path))
+}
+
+fn short_display_path(path: &str) -> String {
+    let path = path.trim();
+    if path.is_empty() {
+        return String::new();
+    }
+    let path = PathBuf::from(path);
+    let base = path
+        .file_name()
+        .and_then(|v| v.to_str())
+        .unwrap_or_default();
+    let dir = path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|v| v.to_str())
+        .unwrap_or_default();
+    if dir.is_empty() {
+        base.to_string()
+    } else {
+        format!("{dir}/{base}")
+    }
 }
 
 fn leading_indent(text: &str) -> String {
