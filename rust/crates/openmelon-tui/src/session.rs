@@ -127,6 +127,26 @@ impl Session {
         self.write_meta()
     }
 
+    pub fn fork_writer(&self) -> Result<Self> {
+        let messages = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.dir.join("messages.jsonl"))
+            .with_context(|| format!("open {}", self.dir.join("messages.jsonl").display()))?;
+        Ok(Self {
+            id: self.id.clone(),
+            dir: self.dir.clone(),
+            workdir: self.workdir.clone(),
+            project_id: self.project_id.clone(),
+            intent: self.intent.clone(),
+            started_at: self.started_at,
+            provider: self.provider.clone(),
+            model: self.model.clone(),
+            resumed_from: self.resumed_from.clone(),
+            messages,
+        })
+    }
+
     pub fn append_prompt(&self, kind: &str, content: &str) -> Result<()> {
         if content.trim().is_empty() {
             return Ok(());

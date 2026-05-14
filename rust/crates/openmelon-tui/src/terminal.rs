@@ -112,9 +112,25 @@ impl Hinter for OpenMelonHelper {
     type Hint = OpenMelonHint;
 
     fn hint(&self, line: &str, pos: usize, _ctx: &RustyContext<'_>) -> Option<Self::Hint> {
+        if line.is_empty() && pos == 0 {
+            return Some(OpenMelonHint {
+                display: "Ask OpenMelon".to_string(),
+                completion: String::new(),
+            });
+        }
         let prefix = slash_prefix(line, pos)?;
         if prefix == "/" {
-            return None;
+            let names = self
+                .commands
+                .iter()
+                .take(8)
+                .map(|command| command.name)
+                .collect::<Vec<_>>()
+                .join(" ");
+            return Some(OpenMelonHint {
+                display: format!(" {names}"),
+                completion: String::new(),
+            });
         }
         self.commands
             .iter()
@@ -254,5 +270,21 @@ mod tests {
         assert!(candidates
             .iter()
             .any(|candidate| candidate.replacement == "/model-image"));
+    }
+
+    #[test]
+    fn hint_shows_placeholder_and_slash_palette_seed() {
+        let helper = OpenMelonHelper::new();
+        let history = DefaultHistory::new();
+        let ctx = RustyContext::new(&history);
+
+        let placeholder = helper.hint("", 0, &ctx).unwrap();
+        assert_eq!(placeholder.display(), "Ask OpenMelon");
+        assert!(placeholder.completion().is_none());
+
+        let slash = helper.hint("/", 1, &ctx).unwrap();
+        assert!(slash.display().contains("/help"));
+        assert!(slash.display().contains("/status"));
+        assert!(slash.completion().is_none());
     }
 }

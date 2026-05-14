@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::Command;
@@ -10,11 +12,16 @@ use crate::config::{default_provider, load_user_config, resolve_provider};
 use crate::image::ImageGenerator;
 use crate::llm::{Message, OpenAIClient};
 use crate::project::{set_project_default, set_project_setting, Workspace};
-use crate::render::{divider, render_block, Block, BlockKind};
+use crate::render::{
+    divider, render_block, render_history as render_transcript_history, render_plain_transcript,
+    Block, BlockKind,
+};
 use crate::runtime::{RunInput, Runtime};
 use crate::session::{load_events, load_history, ProjectLayout, Session};
 use crate::terminal::{Input, LineEditor};
 use crate::tools::{ToolEnv, ToolRegistry};
+
+mod event_tui;
 
 #[derive(Debug, Clone)]
 pub struct AppOptions {
@@ -123,18 +130,21 @@ impl App {
         })
     }
 
-    pub fn run(mut self) -> Result<()> {
-        self.print_header()?;
+    pub fn run(self) -> Result<()> {
+        event_tui::run(self)
+    }
+
+    pub fn run_plain(mut self) -> Result<()> {
         let mut history = self.initial_history.clone();
         let mut session = self.create_session("interactive REPL")?;
-        println!("session: {}", session.dir.display());
+        self.print_header(&session)?;
         if !history.is_empty() {
             println!("loaded {} prior messages", history.len());
             render_history(&history);
         }
 
         loop {
-            match self.editor.read("> ")? {
+            match self.editor.read("› ")? {
                 Input::Line(line) => {
                     let text = line.trim();
                     if text.is_empty() {
@@ -214,16 +224,19 @@ impl App {
             image,
             bash_mode: effective_bash_mode(&self.workspace.project.settings.bash_permission_mode),
             allowed_bash: self.allowed_bash.clone(),
+            approve_bash: None,
         };
         let registry = ToolRegistry::standard(&tool_env);
         let system_prompt = build_project_system_prompt(&self.workspace, &registry.names());
         self.print_context_status(&registry, &tool_env);
-        let runtime = Runtime {
+        let mut runtime = Runtime {
             llm,
             registry,
             env: tool_env,
             max_steps: self.options.max_steps,
             reasoning_effort: self.reasoning_effort.clone(),
+            drain_user_input: None,
+            events: None,
         };
 
         let history_len = history.len();
@@ -246,7 +259,7 @@ impl App {
             &result.finish_artifacts,
             result.finished,
         )?;
-        println!("session: {}", session.dir.display());
+        println!("session {}", session.id);
         Ok(result.messages)
     }
 
@@ -275,28 +288,33 @@ impl App {
         )
     }
 
-    fn print_header(&self) -> Result<()> {
+    fn print_header(&self, session: &Session) -> Result<()> {
+        const RESET: &str = "\x1b[0m";
+        const BOLD: &str = "\x1b[1m";
+        const CYAN: &str = "\x1b[36m";
+
+        println!("{BOLD}{CYAN}OpenMelon{RESET}");
         println!(
-            "openmelon rust — project {} ({})",
-            self.workspace.project.name, self.workspace.project.id
-        );
-        println!("{}", divider(88));
-        println!("workdir: {}", self.workspace.root.display());
-        println!(
-            "model: {}:{} reasoning={}",
+            "project · {} · {} · model {}:{} · reasoning {}",
+            self.workspace.project.name,
+            self.workspace.root.display(),
             self.provider,
             self.model,
             empty_as_auto(&self.reasoning_effort)
         );
         if !self.image_model.is_empty() {
             println!(
-                "image: {}:{}",
+                "image · {}:{}",
                 empty_as_none(&self.image_provider),
                 self.image_model
             );
         }
-        println!("outputs: {}", self.workspace.outputs_dir().display());
-        println!("type /help for commands, Ctrl-D to exit");
+        println!("outputs · {}", self.workspace.outputs_dir().display());
+        println!("session {}", session.id);
+        if let Some(resumed) = &self.resumed_from {
+            println!("resumed from {resumed}");
+        }
+        println!("Type a request, /help for commands, Ctrl-C clears input, Ctrl-D exits.");
         println!();
         io::stdout().flush()?;
         Ok(())
@@ -636,6 +654,7 @@ impl App {
             image: None,
             bash_mode: effective_bash_mode(&self.workspace.project.settings.bash_permission_mode),
             allowed_bash: self.allowed_bash.clone(),
+            approve_bash: None,
         }
     }
 
@@ -809,44 +828,10 @@ fn build_project_system_prompt(workspace: &Workspace, tool_names: &[String]) -> 
 }
 
 fn render_history(messages: &[Message]) {
-    for message in messages {
-        match message.role {
-            crate::llm::Role::System => {}
-            crate::llm::Role::User => println!("> {}", message.content),
-            crate::llm::Role::Assistant => {
-                if !message.content.trim().is_empty() {
-                    println!(
-                        "{}",
-                        render_block(
-                            &Block {
-                                kind: BlockKind::Assistant,
-                                body: message.content.clone(),
-                            },
-                            88,
-                        )
-                    );
-                }
-                for call in &message.tool_calls {
-                    println!(
-                        "{}",
-                        render_block(
-                            &Block {
-                                kind: BlockKind::Tool,
-                                body: format!(
-                                    "tool {} {}",
-                                    call.name,
-                                    serde_json::to_string(&call.arguments)
-                                        .unwrap_or_else(|_| "{}".to_string())
-                                ),
-                            },
-                            88,
-                        )
-                    );
-                }
-            }
-            crate::llm::Role::Tool => println!("  tool result: {}", message.content),
-        }
-    }
+    print!(
+        "{}",
+        render_transcript_history(messages, 88, crate::render::TranscriptMode::Styled)
+    );
 }
 
 fn save_history_jsonl(history: &[Message], path: &str) -> Result<()> {
@@ -859,27 +844,7 @@ fn save_history_jsonl(history: &[Message], path: &str) -> Result<()> {
 }
 
 fn plain_transcript(history: &[Message]) -> String {
-    let mut out = String::new();
-    for message in history {
-        match message.role {
-            crate::llm::Role::System => {}
-            crate::llm::Role::User => out.push_str(&format!("User: {}\n\n", message.content)),
-            crate::llm::Role::Assistant => {
-                if !message.content.trim().is_empty() {
-                    out.push_str(&format!("Assistant: {}\n\n", message.content));
-                }
-                for call in &message.tool_calls {
-                    out.push_str(&format!(
-                        "Tool call: {} {}\n\n",
-                        call.name,
-                        serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".to_string())
-                    ));
-                }
-            }
-            crate::llm::Role::Tool => out.push_str(&format!("Tool: {}\n\n", message.content)),
-        }
-    }
-    out
+    render_plain_transcript(history, 88)
 }
 
 fn render_compaction_draft(packet: &serde_json::Value) -> String {

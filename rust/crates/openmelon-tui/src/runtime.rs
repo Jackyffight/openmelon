@@ -1,8 +1,12 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
+use std::sync::mpsc;
 
 use crate::llm::{ChatRequest, FinishReason, Message, OpenAIClient, Role, ToolCall, Usage};
-use crate::render::{render_block, Block, BlockKind, MarkdownStream};
+use crate::render::{
+    flush_markdown_buffer, render_finish_result, render_tool_call, render_tool_result,
+    TranscriptMode,
+};
 use crate::session::Session;
 use crate::tools::{ToolEnv, ToolRegistry};
 
@@ -12,6 +16,30 @@ pub struct Runtime {
     pub env: ToolEnv,
     pub max_steps: usize,
     pub reasoning_effort: String,
+    pub drain_user_input: Option<Box<dyn FnMut() -> Vec<String> + Send>>,
+    pub events: Option<mpsc::Sender<RuntimeEvent>>,
+}
+
+#[derive(Debug, Clone)]
+pub enum RuntimeEvent {
+    TurnStart {
+        step: usize,
+    },
+    TextDelta(String),
+    ToolCall(ToolCall),
+    ToolResult {
+        tool_name: String,
+        content: String,
+        error: Option<String>,
+    },
+    TurnEnd {
+        step: usize,
+        finish: FinishReason,
+        usage: Usage,
+    },
+    QueuedInputApplied {
+        count: usize,
+    },
 }
 
 pub struct RunInput {
@@ -29,7 +57,7 @@ pub struct RunResult {
 }
 
 impl Runtime {
-    pub fn run(&self, input: RunInput, session: &mut Session) -> Result<RunResult> {
+    pub fn run(&mut self, input: RunInput, session: &mut Session) -> Result<RunResult> {
         let mut messages = if input.history.is_empty() {
             let mut seeded = Vec::new();
             if !input.system_prompt.trim().is_empty() {
@@ -64,14 +92,20 @@ impl Runtime {
         let max_steps = self.max_steps.max(1);
         for step in 0..max_steps {
             result.steps = step + 1;
-            println!();
-            println!("{}", crate::render::divider(88));
-            println!(
-                "turn {} -> {}:{}",
-                step + 1,
-                self.llm.provider(),
-                self.llm.model()
-            );
+            let drained = self.drain_user_input();
+            if !drained.is_empty() {
+                let count = drained.len();
+                for text in drained {
+                    messages.push(Message {
+                        role: Role::User,
+                        content: text,
+                        tool_calls: Vec::new(),
+                        tool_call_id: String::new(),
+                    });
+                }
+                self.emit(RuntimeEvent::QueuedInputApplied { count });
+            }
+            self.emit(RuntimeEvent::TurnStart { step: step + 1 });
             session.append_event(
                 "turn_start",
                 serde_json::json!({
@@ -80,7 +114,8 @@ impl Runtime {
                 }),
             )?;
 
-            let mut markdown = MarkdownStream::default();
+            let mut markdown_buffer = String::new();
+            let events_tx = self.events.clone();
             let response = self
                 .llm
                 .stream_chat(
@@ -90,29 +125,19 @@ impl Runtime {
                         reasoning_effort: self.reasoning_effort.clone(),
                     },
                     |delta| {
-                        let rendered = markdown.push(delta);
-                        if !rendered.is_empty() {
-                            print!("{rendered}");
-                            let _ = std::io::Write::flush(&mut std::io::stdout());
+                        if let Some(tx) = &events_tx {
+                            let _ = tx.send(RuntimeEvent::TextDelta(delta.to_string()));
+                        } else {
+                            markdown_buffer.push_str(delta);
+                            flush_runtime_markdown(&mut markdown_buffer, false);
                         }
                     },
                 )
                 .with_context(|| format!("runtime chat step {}", step + 1))?;
 
-            if !response.message.content.trim().is_empty() {
-                let tail = markdown.flush();
-                if !tail.is_empty() {
-                    println!("{tail}");
-                } else {
-                    println!();
-                }
+            if self.events.is_none() {
+                flush_runtime_markdown(&mut markdown_buffer, true);
             }
-
-            if !response.message.content.trim().is_empty() {
-                // Streamed text already reached stdout. We do not reprint it,
-                // but history/resume still uses the rendered Markdown path.
-            }
-            render_usage(response.usage);
             session.append_event(
                 "turn_response",
                 serde_json::json!({
@@ -131,12 +156,16 @@ impl Runtime {
             )?;
 
             let tool_calls = response.message.tool_calls.clone();
+            let finish_reason = response.finish_reason;
+            let usage = response.usage;
             messages.push(response.message);
             if tool_calls.is_empty() {
-                result.finished = matches!(
-                    response.finish_reason,
-                    FinishReason::Stop | FinishReason::Other
-                );
+                self.emit(RuntimeEvent::TurnEnd {
+                    step: step + 1,
+                    finish: finish_reason,
+                    usage,
+                });
+                result.finished = matches!(finish_reason, FinishReason::Stop | FinishReason::Other);
                 result.messages = messages;
                 return Ok(result);
             }
@@ -151,16 +180,15 @@ impl Runtime {
                         "detail": { "arguments": call.arguments },
                     }),
                 )?;
-                println!(
-                    "{}",
-                    render_block(
-                        &Block {
-                            kind: BlockKind::Tool,
-                            body: format!("{} {}", call.name, one_line_json(&call.arguments)),
-                        },
-                        88,
-                    )
-                );
+                if call.name != "finish" {
+                    if self.events.is_some() {
+                        self.emit(RuntimeEvent::ToolCall(call.clone()));
+                    } else {
+                        flush_runtime_markdown(&mut markdown_buffer, true);
+                        println!();
+                        println!("{}", render_tool_call(&call, TranscriptMode::Styled));
+                    }
+                }
                 let (content, dispatch_err) =
                     match self
                         .registry
@@ -173,16 +201,24 @@ impl Runtime {
                         ),
                     };
                 if let Some(err) = dispatch_err {
-                    println!(
-                        "{}",
-                        render_block(
-                            &Block {
-                                kind: BlockKind::Error,
-                                body: err.clone(),
-                            },
-                            88,
-                        )
-                    );
+                    let content_for_render =
+                        serde_json::json!({ "error": err.clone() }).to_string();
+                    if self.events.is_some() {
+                        self.emit(RuntimeEvent::ToolResult {
+                            tool_name: call.name.clone(),
+                            content: content_for_render.clone(),
+                            error: Some(err.clone()),
+                        });
+                    } else {
+                        println!(
+                            "{}",
+                            render_tool_result(
+                                &call.name,
+                                &content_for_render,
+                                TranscriptMode::Styled,
+                            )
+                        );
+                    }
                     session.append_event(
                         "tool_result",
                         serde_json::json!({
@@ -202,16 +238,19 @@ impl Runtime {
                             .filter_map(|v| v.as_str().map(ToString::to_string))
                             .collect();
                     }
-                    println!(
-                        "{}",
-                        render_block(
-                            &Block {
-                                kind: BlockKind::Assistant,
-                                body: result.finish_summary.clone(),
-                            },
-                            88,
-                        )
-                    );
+                    let finish = serde_json::to_string(&content)?;
+                    if self.events.is_some() {
+                        self.emit(RuntimeEvent::ToolResult {
+                            tool_name: call.name.clone(),
+                            content: finish.clone(),
+                            error: None,
+                        });
+                    } else {
+                        let rendered = render_finish_result(&finish, 88, TranscriptMode::Styled);
+                        if !rendered.trim().is_empty() {
+                            println!("{rendered}");
+                        }
+                    }
                     session.append_event(
                         "tool_result",
                         serde_json::json!({
@@ -222,7 +261,23 @@ impl Runtime {
                         }),
                     )?;
                 } else {
-                    println!("  {}", summarize_tool_result(&call, &content));
+                    let content_for_render = serde_json::to_string(&content)?;
+                    if self.events.is_some() {
+                        self.emit(RuntimeEvent::ToolResult {
+                            tool_name: call.name.clone(),
+                            content: content_for_render.clone(),
+                            error: None,
+                        });
+                    } else {
+                        println!(
+                            "{}",
+                            render_tool_result(
+                                &call.name,
+                                &content_for_render,
+                                TranscriptMode::Styled,
+                            )
+                        );
+                    }
                     session.append_event(
                         "tool_result",
                         serde_json::json!({
@@ -242,54 +297,53 @@ impl Runtime {
                 });
 
                 if call.name == "finish" {
+                    self.emit(RuntimeEvent::TurnEnd {
+                        step: step + 1,
+                        finish: finish_reason,
+                        usage,
+                    });
                     result.finished = true;
                     result.messages = messages;
                     return Ok(result);
                 }
             }
+            self.emit(RuntimeEvent::TurnEnd {
+                step: step + 1,
+                finish: finish_reason,
+                usage,
+            });
         }
 
         result.messages = messages;
         Ok(result)
     }
-}
 
-fn render_usage(usage: Usage) {
-    if usage.total_tokens > 0 {
-        println!(
-            "usage: prompt={} completion={} total={}",
-            usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
-        );
+    fn drain_user_input(&mut self) -> Vec<String> {
+        let Some(drain) = &mut self.drain_user_input else {
+            return Vec::new();
+        };
+        drain()
+            .into_iter()
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty())
+            .collect()
+    }
+
+    fn emit(&self, event: RuntimeEvent) {
+        if let Some(tx) = &self.events {
+            let _ = tx.send(event);
+        }
     }
 }
 
-fn one_line_json(value: &Value) -> String {
-    serde_json::to_string(value)
-        .unwrap_or_else(|_| "<invalid json>".to_string())
-        .chars()
-        .take(240)
-        .collect()
-}
-
-fn summarize_tool_result(call: &ToolCall, value: &Value) -> String {
-    if let Some(err) = value.get("error").and_then(Value::as_str) {
-        return format!("error: {err}");
+fn flush_runtime_markdown(buffer: &mut String, force: bool) {
+    let Some(rendered) = flush_markdown_buffer(buffer, force, 88, TranscriptMode::Styled) else {
+        return;
+    };
+    if rendered.trim().is_empty() {
+        return;
     }
-    match call.name.as_str() {
-        "generate_image" | "save_artifact" => value
-            .get("path")
-            .and_then(Value::as_str)
-            .map(|path| format!("path: {path}"))
-            .unwrap_or_else(|| "done".to_string()),
-        "read_file" => value
-            .get("content")
-            .and_then(Value::as_str)
-            .map(|text| format!("{} chars", text.chars().count()))
-            .unwrap_or_else(|| "done".to_string()),
-        _ => serde_json::to_string(value)
-            .unwrap_or_else(|_| "done".to_string())
-            .chars()
-            .take(180)
-            .collect(),
-    }
+    println!("{rendered}");
+    println!();
+    let _ = std::io::Write::flush(&mut std::io::stdout());
 }

@@ -2,6 +2,7 @@ use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -26,6 +27,23 @@ pub struct ToolEnv {
     pub image: Option<ImageGenerator>,
     pub bash_mode: String,
     pub allowed_bash: std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>,
+    pub approve_bash: Option<ApprovalFn>,
+}
+
+pub type ApprovalFn = std::sync::Arc<dyn Fn(ApprovalRequest) -> ApprovalDecision + Send + Sync>;
+
+#[derive(Debug, Clone)]
+pub struct ApprovalRequest {
+    pub command: String,
+    pub description: String,
+    pub binary: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalDecision {
+    Yes,
+    Always,
+    No,
 }
 
 #[derive(Clone)]
@@ -1303,6 +1321,27 @@ fn approve_bash(env: &ToolEnv, command: &str, description: &str, binary: &str) -
         );
     }
 
+    if let Some(approve) = &env.approve_bash {
+        match approve(ApprovalRequest {
+            command: command.to_string(),
+            description: description.to_string(),
+            binary: binary.to_string(),
+        }) {
+            ApprovalDecision::Yes => return Ok("user-approved".to_string()),
+            ApprovalDecision::Always => {
+                if !binary.is_empty() {
+                    let mut allowed = env
+                        .allowed_bash
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("bash allowlist lock poisoned"))?;
+                    allowed.insert(binary.to_string());
+                }
+                return Ok("user-approved".to_string());
+            }
+            ApprovalDecision::No => return Ok("error:user denied execution".to_string()),
+        }
+    }
+
     render_approval_request(command, description, binary)?;
     let mut answer = String::new();
     io::stdin().read_line(&mut answer)?;
@@ -1336,6 +1375,18 @@ fn render_approval_request(command: &str, description: &str, binary: &str) -> Re
     }
     io::stderr().flush()?;
     Ok(())
+}
+
+pub fn channel_approval_fn(
+    tx: mpsc::Sender<(ApprovalRequest, mpsc::Sender<ApprovalDecision>)>,
+) -> ApprovalFn {
+    std::sync::Arc::new(move |request| {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        if tx.send((request, reply_tx)).is_err() {
+            return ApprovalDecision::No;
+        }
+        reply_rx.recv().unwrap_or(ApprovalDecision::No)
+    })
 }
 
 fn safe_join(root: &Path, rel: &str) -> Result<PathBuf> {
