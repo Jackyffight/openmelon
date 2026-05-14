@@ -33,8 +33,9 @@ const CYAN: &str = "\x1b[36m";
 const CLEAR: &str = "\x1b[2J\x1b[H";
 const HIDE_CURSOR: &str = "\x1b[?25l";
 const SHOW_CURSOR: &str = "\x1b[?25h";
-const STEADY_BAR_CURSOR: &str = "\x1b[6 q";
+const STEADY_BLOCK_CURSOR: &str = "\x1b[2 q";
 const DEFAULT_CURSOR: &str = "\x1b[0 q";
+const IME_COMPOSITION_BUFFER: usize = 18;
 
 const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "show this list of commands"),
@@ -459,11 +460,18 @@ impl TuiState {
         } else {
             (Vec::new(), None)
         };
+        let input_spacer_lines = if matches!(self.overlay, Overlay::None) && !input_lines.is_empty()
+        {
+            vec![String::new()]
+        } else {
+            Vec::new()
+        };
         let status_lines = self.status_lines();
         let approval_lines = self.approval_lines();
         let overlay_count = overlay_lines.len()
             + palette_lines.len()
             + input_lines.len()
+            + input_spacer_lines.len()
             + status_lines.len()
             + approval_lines.len();
         let viewport_height = self.height.saturating_sub(1 + overlay_count).max(1);
@@ -504,6 +512,7 @@ impl TuiState {
             .chain(approval_lines.iter())
             .chain(overlay_lines.iter())
             .chain(input_lines.iter())
+            .chain(input_spacer_lines.iter())
             .chain(status_lines.iter())
         {
             lines.push(line.clone());
@@ -524,7 +533,7 @@ impl TuiState {
         let mut out = String::new();
         out.push_str(CLEAR);
         out.push_str(SHOW_CURSOR);
-        out.push_str(STEADY_BAR_CURSOR);
+        out.push_str(STEADY_BLOCK_CURSOR);
         for (idx, line) in lines.iter().enumerate() {
             out.push_str(&fit_line(line, self.width));
             if idx + 1 < lines.len() {
@@ -633,7 +642,6 @@ impl TuiState {
                 } else {
                     "Custom LLM model id"
                 };
-                let input_width = self.width.saturating_sub(2).max(1);
                 let mut lines = vec![
                     format!("{BOLD}{title}{RESET}"),
                     format!(
@@ -642,6 +650,10 @@ impl TuiState {
                     String::new(),
                 ];
                 let input_start = lines.len();
+                let width = self
+                    .width
+                    .saturating_sub(2 + IME_COMPOSITION_BUFFER)
+                    .max(12);
                 let (input_lines, cursor) = render_prompt_lines(
                     if self.input.is_empty() {
                         format!("{DIM}Model id{RESET}")
@@ -650,7 +662,7 @@ impl TuiState {
                     },
                     &self.input,
                     self.cursor,
-                    input_width,
+                    width,
                 );
                 lines.extend(input_lines);
                 let cursor = cursor.map(|(row, col)| (input_start + row, col));
@@ -810,7 +822,10 @@ impl TuiState {
     }
 
     fn input_lines(&self) -> (Vec<String>, Option<(usize, usize)>) {
-        let width = self.width.saturating_sub(4).max(1);
+        let width = self
+            .width
+            .saturating_sub(4 + IME_COMPOSITION_BUFFER)
+            .max(12);
         let text = if self.input.is_empty() {
             format!("{DIM}Ask OpenMelon{RESET}")
         } else {
