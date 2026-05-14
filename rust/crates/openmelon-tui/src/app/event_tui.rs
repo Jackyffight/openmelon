@@ -14,7 +14,7 @@ use super::{
 };
 use crate::config::{load_user_config, resolve_provider};
 use crate::image::ImageGenerator;
-use crate::llm::{Message, OpenAIClient};
+use crate::llm::{Message, OpenAIClient, Usage};
 use crate::project::{set_project_default, set_project_setting};
 use crate::render::{
     history_rule, render_finish_result, render_markdown, render_plain_transcript,
@@ -33,6 +33,8 @@ const CYAN: &str = "\x1b[36m";
 const CLEAR: &str = "\x1b[2J\x1b[H";
 const HIDE_CURSOR: &str = "\x1b[?25l";
 const SHOW_CURSOR: &str = "\x1b[?25h";
+const STEADY_BAR_CURSOR: &str = "\x1b[6 q";
+const DEFAULT_CURSOR: &str = "\x1b[0 q";
 
 const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "show this list of commands"),
@@ -198,8 +200,8 @@ struct TuiState {
     running: bool,
     activity: String,
     run_started: Option<Instant>,
-    prompt_tokens: u64,
-    completion_tokens: u64,
+    turn_usage: Usage,
+    last_usage: Usage,
     history: Vec<Message>,
     persisted_up_to: usize,
     active_skill: String,
@@ -287,8 +289,8 @@ impl TuiState {
             running: false,
             activity: String::new(),
             run_started: None,
-            prompt_tokens: 0,
-            completion_tokens: 0,
+            turn_usage: Usage::default(),
+            last_usage: Usage::default(),
             history: Vec::new(),
             persisted_up_to: app.initial_history.len(),
             active_skill: String::new(),
@@ -441,20 +443,21 @@ impl TuiState {
 
     fn render(&mut self, term: &mut TerminalGuard) -> Result<()> {
         let mut lines = Vec::with_capacity(self.height.max(1));
+        let mut cursor_position = None;
 
         let header = self.header_line();
         lines.push(header);
 
-        let overlay_lines = self.overlay_lines();
+        let (overlay_lines, overlay_cursor) = self.overlay_lines();
         let palette_lines = if matches!(self.overlay, Overlay::None) {
             self.palette_lines()
         } else {
             Vec::new()
         };
-        let input_lines = if matches!(self.overlay, Overlay::None) {
+        let (input_lines, input_cursor) = if matches!(self.overlay, Overlay::None) {
             self.input_lines()
         } else {
-            Vec::new()
+            (Vec::new(), None)
         };
         let status_lines = self.status_lines();
         let approval_lines = self.approval_lines();
@@ -505,16 +508,35 @@ impl TuiState {
         {
             lines.push(line.clone());
         }
+        if let Some((row, col)) = input_cursor {
+            let input_start = 1
+                + viewport_height
+                + palette_lines.len()
+                + approval_lines.len()
+                + overlay_lines.len();
+            cursor_position = Some((input_start + row, col));
+        } else if let Some((row, col)) = overlay_cursor {
+            let overlay_start = 1 + viewport_height + palette_lines.len() + approval_lines.len();
+            cursor_position = Some((overlay_start + row, col));
+        }
         lines.truncate(self.height.max(1));
 
         let mut out = String::new();
         out.push_str(CLEAR);
-        out.push_str(HIDE_CURSOR);
+        out.push_str(SHOW_CURSOR);
+        out.push_str(STEADY_BAR_CURSOR);
         for (idx, line) in lines.iter().enumerate() {
             out.push_str(&fit_line(line, self.width));
             if idx + 1 < lines.len() {
                 out.push('\n');
             }
+        }
+        if let Some((row, col)) = cursor_position {
+            let row = row.min(self.height.saturating_sub(1)) + 1;
+            let col = col.min(self.width.saturating_sub(1)) + 1;
+            out.push_str(&format!("\x1b[{row};{col}H"));
+        } else {
+            out.push_str(HIDE_CURSOR);
         }
         term.write_all(out.as_bytes())?;
         term.flush()?;
@@ -545,15 +567,13 @@ impl TuiState {
                 .map(|t| format_elapsed(t.elapsed()))
                 .unwrap_or_default();
             format!(
-                "{} · {} · {} in / {} out",
+                "{} · {}",
                 if self.activity.is_empty() {
                     "Thinking"
                 } else {
                     &self.activity
                 },
-                elapsed,
-                short_int(self.prompt_tokens),
-                short_int(self.completion_tokens)
+                elapsed
             )
         } else {
             "Ready".to_string()
@@ -561,8 +581,20 @@ impl TuiState {
         if self.pending_count > 0 {
             left.push_str(&format!(" · {} pending", self.pending_count));
         }
-        let right = "esc clear · ctrl+c twice quit · pgup/pgdn scroll";
-        vec![join_status_line(&left, right, self.width)]
+        let tokens = if self.running && self.turn_usage.total_tokens > 0 {
+            format_usage(self.turn_usage)
+        } else if !self.running && self.last_usage.total_tokens > 0 {
+            format!("last {}", format_usage(self.last_usage))
+        } else {
+            String::new()
+        };
+        let hints = "esc clear · ctrl+c twice quit · pgup/pgdn scroll";
+        let right = if tokens.is_empty() {
+            hints.to_string()
+        } else {
+            format!("{tokens} · {hints}")
+        };
+        vec![join_status_line(&left, &right, self.width)]
     }
 
     fn palette_lines(&self) -> Vec<String> {
@@ -591,29 +623,40 @@ impl TuiState {
         lines
     }
 
-    fn overlay_lines(&self) -> Vec<String> {
+    fn overlay_lines(&self) -> (Vec<String>, Option<(usize, usize)>) {
         match &self.overlay {
-            Overlay::None => Vec::new(),
-            Overlay::ModelSelect { image, cursor } => self.selector_lines(*image, *cursor),
+            Overlay::None => (Vec::new(), None),
+            Overlay::ModelSelect { image, cursor } => (self.selector_lines(*image, *cursor), None),
             Overlay::ModelCustom { image } => {
                 let title = if *image {
                     "Custom image model id"
                 } else {
                     "Custom LLM model id"
                 };
-                vec![
+                let input_width = self.width.saturating_sub(2).max(1);
+                let mut lines = vec![
                     format!("{BOLD}{title}{RESET}"),
                     format!(
                         "{DIM}Type a provider-specific model id, then Enter. Esc cancels.{RESET}"
                     ),
                     String::new(),
-                    format!(
-                        "{CYAN}›{RESET} {}",
-                        render_input_with_cursor(&self.input, self.cursor)
-                    ),
-                ]
+                ];
+                let input_start = lines.len();
+                let (input_lines, cursor) = render_prompt_lines(
+                    if self.input.is_empty() {
+                        format!("{DIM}Model id{RESET}")
+                    } else {
+                        self.input.clone()
+                    },
+                    &self.input,
+                    self.cursor,
+                    input_width,
+                );
+                lines.extend(input_lines);
+                let cursor = cursor.map(|(row, col)| (input_start + row, col));
+                (lines, cursor)
             }
-            Overlay::Settings { cursor } => self.settings_lines(*cursor),
+            Overlay::Settings { cursor } => (self.settings_lines(*cursor), None),
         }
     }
 
@@ -766,25 +809,14 @@ impl TuiState {
         lines
     }
 
-    fn input_lines(&self) -> Vec<String> {
+    fn input_lines(&self) -> (Vec<String>, Option<(usize, usize)>) {
         let width = self.width.saturating_sub(4).max(1);
         let text = if self.input.is_empty() {
-            format!("\x1b[7m \x1b[0m{DIM}Ask OpenMelon{RESET}")
+            format!("{DIM}Ask OpenMelon{RESET}")
         } else {
-            render_input_with_cursor(&self.input, self.cursor)
+            self.input.clone()
         };
-        let mut lines = wrap_text(&text, width);
-        if lines.is_empty() {
-            lines.push(String::new());
-        }
-        for (idx, line) in lines.iter_mut().enumerate() {
-            if idx == 0 {
-                *line = format!("{CYAN}›{RESET} {line}");
-            } else {
-                *line = format!("  {line}");
-            }
-        }
-        lines
+        render_prompt_lines(text, &self.input, self.cursor, width)
     }
 
     fn transcript_lines(&self) -> Vec<TranscriptLine> {
@@ -1438,6 +1470,9 @@ impl TuiState {
             match event {
                 RuntimeEvent::TurnStart { step } => {
                     self.activity = format!("Thinking step {step}");
+                    if step == 1 {
+                        self.turn_usage = Usage::default();
+                    }
                     self.mark_dirty();
                 }
                 RuntimeEvent::TextDelta(delta) => {
@@ -1484,8 +1519,8 @@ impl TuiState {
                 } => {
                     self.flush_streaming();
                     self.activity = format!("Turn {step} ended ({finish:?})");
-                    self.prompt_tokens += usage.prompt_tokens;
-                    self.completion_tokens += usage.completion_tokens;
+                    add_usage(&mut self.turn_usage, usage);
+                    self.last_usage = self.turn_usage;
                     self.mark_dirty();
                 }
                 RuntimeEvent::QueuedInputApplied { count } => {
@@ -2005,7 +2040,7 @@ impl TerminalGuard {
         if self.left {
             return Ok(());
         }
-        write!(self.stdout, "{RESET}{SHOW_CURSOR}\r\n")?;
+        write!(self.stdout, "{RESET}{DEFAULT_CURSOR}{SHOW_CURSOR}\r\n")?;
         self.stdout.flush()?;
         if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &self.original) } != 0 {
             return Err(io::Error::last_os_error()).context("restore terminal");
@@ -2365,23 +2400,46 @@ fn fit_line(line: &str, width: usize) -> String {
     out
 }
 
-fn render_input_with_cursor(input: &str, cursor: usize) -> String {
-    let mut out = String::new();
-    let mut inserted = false;
-    for (idx, ch) in input.char_indices() {
-        if idx == cursor {
-            out.push_str("\x1b[7m");
-            out.push(ch);
-            out.push_str(RESET);
-            inserted = true;
+fn render_prompt_lines(
+    text: String,
+    raw_input: &str,
+    cursor: usize,
+    width: usize,
+) -> (Vec<String>, Option<(usize, usize)>) {
+    let mut lines = wrap_text(&text, width);
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    let cursor = input_cursor_position(raw_input, cursor, width);
+    for (idx, line) in lines.iter_mut().enumerate() {
+        if idx == 0 {
+            *line = format!("{CYAN}›{RESET} {line}");
         } else {
-            out.push(ch);
+            *line = format!("  {line}");
         }
     }
-    if !inserted {
-        out.push_str("\x1b[7m \x1b[0m");
+    (lines, Some(cursor))
+}
+
+fn input_cursor_position(input: &str, cursor: usize, width: usize) -> (usize, usize) {
+    let mut row = 0usize;
+    let mut col = 0usize;
+    let width = width.max(1);
+    for ch in input[..cursor.min(input.len())].chars() {
+        if ch == '\n' {
+            row += 1;
+            col = 0;
+            continue;
+        }
+        let w = ch.width().unwrap_or(0);
+        if col > 0 && col + w > width {
+            row += 1;
+            col = 0;
+        }
+        col += w;
     }
-    out
+    let prefix_width = if row == 0 { 2 } else { 2 };
+    (row, prefix_width + col)
 }
 
 fn display_width(text: &str) -> usize {
@@ -2469,6 +2527,26 @@ fn short_int(n: u64) -> String {
     } else {
         format!("{}k", n / 1000)
     }
+}
+
+fn add_usage(total: &mut Usage, next: Usage) {
+    total.prompt_tokens += next.prompt_tokens;
+    total.completion_tokens += next.completion_tokens;
+    total.total_tokens += next.total_tokens;
+}
+
+fn format_usage(usage: Usage) -> String {
+    let total = if usage.total_tokens > 0 {
+        usage.total_tokens
+    } else {
+        usage.prompt_tokens + usage.completion_tokens
+    };
+    format!(
+        "tok {} · in {} / out {}",
+        short_int(total),
+        short_int(usage.prompt_tokens),
+        short_int(usage.completion_tokens)
+    )
 }
 
 fn print_osc52(text: &str) -> Result<()> {
