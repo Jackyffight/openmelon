@@ -534,15 +534,16 @@ impl TuiState {
         out.push_str(CLEAR);
         out.push_str(SHOW_CURSOR);
         out.push_str(STEADY_BLOCK_CURSOR);
+        let draw_width = self.width.saturating_sub(1).max(1);
         for (idx, line) in lines.iter().enumerate() {
-            out.push_str(&fit_line(line, self.width));
+            out.push_str(&fit_line(line, draw_width));
             if idx + 1 < lines.len() {
                 out.push('\n');
             }
         }
         if let Some((row, col)) = cursor_position {
             let row = row.min(self.height.saturating_sub(1)) + 1;
-            let col = col.min(self.width.saturating_sub(1)) + 1;
+            let col = col.min(draw_width.saturating_sub(1)) + 1;
             out.push_str(&format!("\x1b[{row};{col}H"));
         } else {
             out.push_str(HIDE_CURSOR);
@@ -2408,9 +2409,6 @@ fn fit_line(line: &str, width: usize) -> String {
     }
     if saw_ansi && !out.ends_with(RESET) {
         out.push_str(RESET);
-    }
-    if col < width {
-        out.push_str(&" ".repeat(width - col));
     }
     out
 }
