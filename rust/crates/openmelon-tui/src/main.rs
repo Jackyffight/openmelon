@@ -58,6 +58,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Repl,
+    EventTui,
     Demo,
     Run { prompt: String },
     Resume { session_id: String },
@@ -90,6 +91,7 @@ fn main() -> Result<()> {
 
     match command {
         Command::Repl => app::App::new(options, None)?.run(),
+        Command::EventTui => app::App::new(options, None)?.run_event_tui(),
         Command::Demo => app::App::new_demo(options.workdir)?.run_demo(),
         Command::Run { prompt } => app::App::new(options, None)?.run_one_shot(prompt),
         Command::Resume { session_id } => app::App::new(options, Some(session_id))?.run(),

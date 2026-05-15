@@ -131,6 +131,10 @@ impl App {
     }
 
     pub fn run(self) -> Result<()> {
+        self.run_plain()
+    }
+
+    pub fn run_event_tui(self) -> Result<()> {
         event_tui::run(self)
     }
 
