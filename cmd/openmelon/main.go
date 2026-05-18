@@ -39,17 +39,18 @@ import (
 // Anything else (including "-p" / "--project") falls through to the
 // legacy flag-based dispatcher below for backward compatibility.
 var subcommands = map[string]func(args []string) error{
-	"init":      runInit,
-	"project":   runProject,
-	"character": runCharacter,
-	"reference": runReference,
-	"material":  runMaterial,
-	"search":    runSearch,
-	"space":     runSpace,
-	"repl":      runRepl,
-	"setup":     runSetup,
-	"resume":    runResume,
-	"session":   runSession,
+	"init":           runInit,
+	"project":        runProject,
+	"character":      runCharacter,
+	"reference":      runReference,
+	"material":       runMaterial,
+	"search":         runSearch,
+	"space":          runSpace,
+	"repl":           runRepl,
+	"setup":          runSetup,
+	"resume":         runResume,
+	"session":        runSession,
+	"runtime-bridge": runRuntimeBridge,
 }
 
 func main() {
@@ -188,6 +189,7 @@ func printHelp() {
 	fmt.Fprintln(os.Stderr, "  space create|list|show|context       Creative continuity spaces")
 	fmt.Fprintln(os.Stderr, "  session events <id>                  Inspect session lifecycle events")
 	fmt.Fprintln(os.Stderr, `  search "<query>"                     Grep across the project libraries`)
+	fmt.Fprintln(os.Stderr, "  runtime-bridge                       JSONL bridge for the TS TUI")
 	fmt.Fprintln(os.Stderr, "")
 	fmt.Fprintln(os.Stderr, "One-shot generation:")
 	fmt.Fprintln(os.Stderr, `  openmelon -p "<intent>" [--skill skillplus:<name>] [--publish vbox]`)
