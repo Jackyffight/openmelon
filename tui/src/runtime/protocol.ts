@@ -16,7 +16,7 @@ export type RuntimeEvent =
 	  }
 	| {type: 'status'; status: RuntimeStatus; activity: string}
 	| {type: 'append'; kind: TranscriptKind; text: string; delta?: boolean; markdown?: boolean}
-	| {type: 'pending-applied'; count: number}
+	| {type: 'pending-applied'; texts: string[]}
 	| {type: 'usage'; promptTokens?: number; completionTokens?: number; totalTokens?: number}
 	| {type: 'approval'; activity?: string; detail?: ApprovalRequest}
 	| {type: 'done'}
@@ -47,6 +47,7 @@ export type RuntimeClient = {
 	isAvailable(): boolean;
 	run(text: string): void;
 	pending(text: string): void;
+	unpending(text: string): void;
 	cancel(): void;
 	clearHistory(): void;
 	history(): void;

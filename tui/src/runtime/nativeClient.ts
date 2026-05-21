@@ -213,9 +213,17 @@ export function createNativeRuntimeClient(emit: RuntimeEventHandler, options: Ru
 	function drainPending() {
 		const out = pending.splice(0);
 		if (out.length > 0) {
-			emit({type: 'pending-applied', count: out.length});
+			emit({type: 'pending-applied', texts: out});
 		}
 		return out;
+	}
+
+	function removePending(text: string) {
+		const index = pending.indexOf(text);
+		if (index < 0) {
+			return;
+		}
+		pending.splice(index, 1);
 	}
 
 	function approvalRequest(req: {id: string; tool: string; command: string; description: string; binary: string}) {
@@ -276,6 +284,9 @@ export function createNativeRuntimeClient(emit: RuntimeEventHandler, options: Ru
 			if (text.trim()) {
 				pending.push(text.trim());
 			}
+		},
+		unpending(text: string) {
+			removePending(text.trim());
 		},
 		cancel() {
 			controller?.abort();

@@ -12,6 +12,8 @@ export type RuntimeStatus = 'ready' | 'thinking' | 'tool' | 'error';
 export type TuiState = {
 	items: TranscriptItem[];
 	input: string;
+	inputCursor: number;
+	inputPreferredColumn: number | null;
 	inputHistory: string[];
 	historyIndex: number | null;
 	historyDraft: string;
@@ -42,6 +44,8 @@ export type TuiAction =
 	| {type: 'set-input'; input: string}
 	| {type: 'insert'; text: string}
 	| {type: 'backspace'}
+	| {type: 'delete-forward'}
+	| {type: 'move-input'; movement: 'left' | 'right' | 'start' | 'end' | 'line-start' | 'line-end' | 'up' | 'down'; width?: number}
 	| {type: 'clear-input'; notice?: string; remember?: boolean}
 	| {type: 'commit-input'; text: string}
 	| {type: 'submit-start'; text: string}
@@ -52,6 +56,7 @@ export type TuiAction =
 	| {type: 'palette-reset'}
 	| {type: 'queue-pending'; text: string}
 	| {type: 'pending-applied'; count: number}
+	| {type: 'recall-pending'; texts?: string[]}
 	| {type: 'drain-pending'}
 	| {type: 'status'; status: RuntimeStatus; activity?: string}
 	| {type: 'notice'; notice: string}

@@ -127,7 +127,10 @@ export function App({resumeId, initialPrompt, onSessionInfo}: Props) {
 				}
 				break;
 			case 'pending-applied':
-				dispatch({type: 'pending-applied', count: event.count});
+				for (const text of event.texts) {
+					dispatch({type: 'commit-input', text});
+				}
+				dispatch({type: 'pending-applied', count: event.texts.length});
 				break;
 			case 'status':
 				if ((event.status === 'thinking' || event.status === 'tool') && !stateRef.current.runStartedAt) {
@@ -377,11 +380,10 @@ export function App({resumeId, initialPrompt, onSessionInfo}: Props) {
 		}
 
 		if (running) {
-			dispatch({type: 'commit-input', text: visibleText});
 			submittedRef.current = true;
 			dispatch({type: 'queue-pending', text});
-			dispatch({type: 'append', kind: 'info', text: 'queued pending input'});
-			runtimeBridge.current?.run(text);
+			dispatch({type: 'clear-input', remember: true});
+			runtimeBridge.current?.pending(text);
 			return;
 		}
 
@@ -606,12 +608,45 @@ export function App({resumeId, initialPrompt, onSessionInfo}: Props) {
 			return;
 		}
 
+		if (key.leftArrow) {
+			dispatch({type: 'move-input', movement: 'left'});
+			return;
+		}
+		if (key.rightArrow) {
+			dispatch({type: 'move-input', movement: 'right'});
+			return;
+		}
+		if ((key.ctrl && chunk === 'a') || isHomeKey(chunk)) {
+			dispatch({type: 'move-input', movement: 'line-start'});
+			return;
+		}
+		if ((key.ctrl && chunk === 'e') || isEndKey(chunk)) {
+			dispatch({type: 'move-input', movement: 'line-end'});
+			return;
+		}
+
 		if (key.upArrow) {
-			dispatch({type: 'history-prev'});
+			if (running && current.input.length === 0 && current.pendingInputs.length > 0) {
+				const pendingTexts = [...current.pendingInputs];
+				for (const pending of current.pendingInputs) {
+					runtimeBridge.current?.unpending(pending);
+				}
+				dispatch({type: 'recall-pending', texts: pendingTexts});
+				return;
+			}
+			if (current.input.length === 0 || current.historyIndex !== null) {
+				dispatch({type: 'history-prev'});
+			} else {
+				dispatch({type: 'move-input', movement: 'up', width: promptInputWidth(width)});
+			}
 			return;
 		}
 		if (key.downArrow) {
-			dispatch({type: 'history-next'});
+			if (current.input.length === 0 || current.historyIndex !== null) {
+				dispatch({type: 'history-next'});
+			} else {
+				dispatch({type: 'move-input', movement: 'down', width: promptInputWidth(width)});
+			}
 			return;
 		}
 
@@ -629,8 +664,12 @@ export function App({resumeId, initialPrompt, onSessionInfo}: Props) {
 			return;
 		}
 
-		if (key.backspace || key.delete) {
+		if (key.backspace || isBackspaceKey(chunk) || (key.delete && !isDeleteKey(chunk))) {
 			dispatch({type: 'backspace'});
+			return;
+		}
+		if (isDeleteKey(chunk)) {
+			dispatch({type: 'delete-forward'});
 			return;
 		}
 
@@ -685,7 +724,7 @@ export function App({resumeId, initialPrompt, onSessionInfo}: Props) {
 				) : filteredCommands.length > 0 ? (
 					<SlashPalette commands={filteredCommands} active={state.paletteIndex} />
 				) : null}
-				{!overlay && <PromptInput input={state.input} placeholder={placeholder} width={width} />}
+				{!overlay && <PromptInput input={state.input} cursor={state.inputCursor} placeholder={placeholder} width={width} />}
 				<StatusLine state={state} width={width} />
 			</Box>
 		</Box>
@@ -716,6 +755,18 @@ function isHomeKey(chunk: string) {
 
 function isEndKey(chunk: string) {
 	return chunk === '\u001B[F' || chunk === '\u001B[4~' || chunk === '\u001BOF';
+}
+
+function isDeleteKey(chunk: string) {
+	return chunk === '\u001B[3~';
+}
+
+function isBackspaceKey(chunk: string) {
+	return chunk === '\u007F' || chunk === '\b' || chunk === '\u0008';
+}
+
+function promptInputWidth(width: number) {
+	return Math.max(12, width - 2 - 6);
 }
 
 function normalizeTextInput(chunk: string) {

@@ -1,9 +1,21 @@
 import type {TuiAction, TuiState} from './types.js';
+import {
+	backspace,
+	deleteForward,
+	editorWithText,
+	insertText,
+	moveCursor,
+	moveLineBoundary,
+	moveVertical,
+	type InputEditor
+} from './inputEditor.js';
 
 export function initialState(): TuiState {
 	return {
 		items: [],
 		input: '',
+		inputCursor: 0,
+		inputPreferredColumn: null,
 		inputHistory: [],
 		historyIndex: null,
 		historyDraft: '',
@@ -61,15 +73,27 @@ export function reducer(state: TuiState, action: TuiAction): TuiState {
 			};
 		}
 		case 'set-input':
-			return {...state, input: action.input, historyIndex: null, notice: ''};
+			return updateInput(state, editorWithText(action.input), {historyIndex: null, notice: ''});
 		case 'insert':
-			return {...state, input: state.input + action.text, historyIndex: null, notice: ''};
+			return updateInput(state, insertText(currentEditor(state), action.text), {historyIndex: null, notice: ''});
 		case 'backspace':
-			return {
-				...state,
-				input: Array.from(state.input).slice(0, -1).join(''),
-				historyIndex: null
-			};
+			return updateInput(state, backspace(currentEditor(state)), {historyIndex: null});
+		case 'delete-forward':
+			return updateInput(state, deleteForward(currentEditor(state)), {historyIndex: null});
+		case 'move-input': {
+			const editor = currentEditor(state);
+			const next =
+				action.movement === 'line-start'
+					? moveLineBoundary(editor, 'start')
+					: action.movement === 'line-end'
+						? moveLineBoundary(editor, 'end')
+						: action.movement === 'up'
+							? moveVertical(editor, -1, action.width ?? 80)
+							: action.movement === 'down'
+								? moveVertical(editor, 1, action.width ?? 80)
+								: moveCursor(editor, action.movement);
+			return updateInput(state, next);
+		}
 		case 'clear-input': {
 			const remember = action.remember ?? true;
 			const inputHistory =
@@ -79,6 +103,8 @@ export function reducer(state: TuiState, action: TuiAction): TuiState {
 			return {
 				...state,
 				input: '',
+				inputCursor: 0,
+				inputPreferredColumn: null,
 				inputHistory,
 				historyIndex: null,
 				historyDraft: '',
@@ -96,6 +122,8 @@ export function reducer(state: TuiState, action: TuiAction): TuiState {
 				...state,
 				items: [...state.items, {id: state.nextId, kind: 'user', text: action.text}],
 				input: '',
+				inputCursor: 0,
+				inputPreferredColumn: null,
 				inputHistory,
 				historyIndex: null,
 				historyDraft: '',
@@ -115,11 +143,11 @@ export function reducer(state: TuiState, action: TuiAction): TuiState {
 					...state,
 					historyDraft: state.input,
 					historyIndex: next,
-					input: state.inputHistory[next] ?? state.input
+					...inputPatch(editorWithText(state.inputHistory[next] ?? state.input))
 				};
 			}
 			const next = Math.max(0, state.historyIndex - 1);
-			return {...state, historyIndex: next, input: state.inputHistory[next] ?? state.input};
+			return {...state, historyIndex: next, ...inputPatch(editorWithText(state.inputHistory[next] ?? state.input))};
 		}
 		case 'history-next': {
 			if (state.historyIndex === null) {
@@ -127,9 +155,9 @@ export function reducer(state: TuiState, action: TuiAction): TuiState {
 			}
 			const next = state.historyIndex + 1;
 			if (next >= state.inputHistory.length) {
-				return {...state, historyIndex: null, input: state.historyDraft, historyDraft: ''};
+				return {...state, historyIndex: null, ...inputPatch(editorWithText(state.historyDraft)), historyDraft: ''};
 			}
-			return {...state, historyIndex: next, input: state.inputHistory[next] ?? state.input};
+			return {...state, historyIndex: next, ...inputPatch(editorWithText(state.inputHistory[next] ?? state.input))};
 		}
 		case 'palette-prev':
 			if (action.count <= 0) {
@@ -157,6 +185,19 @@ export function reducer(state: TuiState, action: TuiAction): TuiState {
 			return {
 				...state,
 				pendingInputs: count >= state.pendingInputs.length ? [] : state.pendingInputs.slice(count)
+			};
+		}
+		case 'recall-pending': {
+			const pending = action.texts ?? state.pendingInputs;
+			if (pending.length === 0 || state.input.trim().length > 0) {
+				return state;
+			}
+			const text = pending.join('\n\n');
+			return {
+				...state,
+				...inputPatch(editorWithText(text)),
+				pendingInputs: [],
+				notice: 'pending input recalled'
 			};
 		}
 		case 'drain-pending':
@@ -197,4 +238,20 @@ export function reducer(state: TuiState, action: TuiAction): TuiState {
 		case 'clear-transcript':
 			return {...state, items: [], nextId: 1};
 	}
+}
+
+function currentEditor(state: TuiState): InputEditor {
+	return {
+		text: state.input,
+		cursor: Math.min(state.inputCursor, Array.from(state.input).length),
+		preferredColumn: state.inputPreferredColumn
+	};
+}
+
+function inputPatch(editor: InputEditor) {
+	return {input: editor.text, inputCursor: editor.cursor, inputPreferredColumn: editor.preferredColumn};
+}
+
+function updateInput(state: TuiState, editor: InputEditor, patch: Partial<TuiState> = {}): TuiState {
+	return {...state, ...inputPatch(editor), ...patch};
 }
