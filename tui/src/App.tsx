@@ -758,9 +758,6 @@ function renderHistory(messages: ChatMessage[]) {
 			case 'tool': {
 				const tool = message.tool_call_id ? toolNames.get(message.tool_call_id) : '';
 				if (tool === 'finish') {
-					if (message.content?.trim()) {
-						output.push({kind: 'assistant', text: finishText(message.content)});
-					}
 					break;
 				}
 				output.push({kind: 'result', text: `└ ${compactToolContent(message.content ?? '')}`});
@@ -795,15 +792,6 @@ function compactToolContent(content: string) {
 		}
 	} catch {}
 	return truncateOneLine(content, 180);
-}
-
-function finishText(content: string) {
-	try {
-		const parsed = JSON.parse(content) as {summary?: string};
-		return parsed.summary?.trim() || content;
-	} catch {
-		return content;
-	}
 }
 
 function truncateOneLine(text: string, max: number) {

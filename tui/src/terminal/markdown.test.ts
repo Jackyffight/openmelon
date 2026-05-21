@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {renderMarkdownLines, renderMarkdownPlain} from './markdown.js';
+import {accentColor} from '../theme.js';
 
 test('renders common markdown blocks into terminal lines', () => {
 	const lines = renderMarkdownLines(`# Plan
@@ -25,6 +26,22 @@ const value = 1;
 
 test('plain markdown removes inline markers and expands links', () => {
 	assert.equal(renderMarkdownPlain('Use **bold**, `code`, and [OpenMelon](https://example.test).'), 'Use bold, code, and OpenMelon (https://example.test).');
+});
+
+test('renders blockquotes as highlighted judgment blocks', () => {
+	const [line] = renderMarkdownLines('> 作为成熟消费产品，现在还不能下结论。');
+
+	assert.equal(line?.text, '> 作为成熟消费产品，现在还不能下结论。');
+	assert.equal(line?.color, accentColor);
+	assert.equal(line?.bold, true);
+});
+
+test('renders lower-level headings as visible section markers', () => {
+	const lines = renderMarkdownLines('### 第一，agent-native 这个定位比较少见');
+
+	assert.equal(lines[0]?.text, '第一，agent-native 这个定位比较少见');
+	assert.equal(lines[0]?.color, accentColor);
+	assert.equal(lines[0]?.bold, true);
 });
 
 test('renders nested and task lists without losing hierarchy', () => {

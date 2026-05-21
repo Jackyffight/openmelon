@@ -1,10 +1,5 @@
-const orderedList = /^(\s*)(\d+)[.)]\s+(.*)$/;
-const unorderedList = /^(\s*)[-*+]\s+(.*)$/;
-const taskList = /^(\s*)[-*+]\s+\[([ xX])]\s+(.*)$/;
-const blockquote = /^(\s*)>+\s?(.*)$/;
-const link = /!?\[([^\]]*)]\(([^)\s]+)(?:\s+"[^"]*")?\)/g;
-const autolink = /<((?:https?:\/\/|mailto:)[^>]+)>/g;
-const htmlTag = /<\/?[a-z][^>]*>/gi;
+import {marked, type Token, type Tokens} from 'marked';
+import {accentColor} from '../theme.js';
 
 export type MarkdownLine = {
 	text: string;
@@ -12,99 +7,19 @@ export type MarkdownLine = {
 	bold?: boolean;
 };
 
+type RenderContext = {
+	indent: string;
+	quote: boolean;
+};
+
 export function renderMarkdownLines(source: string): MarkdownLine[] {
-	const normalized = source.replace(/\r\n/g, '\n');
-	const lines = normalized.split('\n');
-	const out: MarkdownLine[] = [];
-	let inFence = false;
-	let fenceLang = '';
-
-	for (let index = 0; index < lines.length; index++) {
-		const line = lines[index] ?? '';
-		const trimmed = line.trim();
-		const fence = fenceMarker(trimmed);
-		if (fence) {
-			if (inFence) {
-				inFence = false;
-				fenceLang = '';
-			} else {
-				inFence = true;
-				fenceLang = fence.lang;
-				if (fenceLang) {
-					out.push({text: `  ${fenceLang}`, color: 'gray'});
-				}
-			}
-			continue;
-		}
-
-		if (inFence) {
-			out.push({text: `  ${line}`, color: 'cyan'});
-			continue;
-		}
-
-		if (trimmed === '') {
-			out.push({text: ''});
-			continue;
-		}
-
-		const next = lines[index + 1]?.trim();
-		if (next && isSetextHeading(next)) {
-			out.push({text: renderInline(trimmed), bold: true, color: next.startsWith('=') ? 'white' : 'gray'});
-			index++;
-			continue;
-		}
-
-		if (isHeading(trimmed)) {
-			const {level, text} = splitHeading(trimmed);
-			out.push({text: renderInline(text), bold: true, color: level <= 2 ? 'white' : 'gray'});
-			continue;
-		}
-
-		if (isRule(trimmed)) {
-			out.push({text: '─'.repeat(40), color: 'gray'});
-			continue;
-		}
-
-		if (isTableDelimiter(trimmed)) {
-			continue;
-		}
-
-		if (isTableRow(trimmed)) {
-			out.push({text: renderTableRow(trimmed), color: 'white'});
-			continue;
-		}
-
-		const quote = blockquote.exec(line);
-		if (quote) {
-			out.push({text: `${indentFor(quote[1] ?? '')}> ${renderInline(quote[2]?.trim() ?? '')}`, color: 'gray'});
-			continue;
-		}
-
-		const task = taskList.exec(line);
-		if (task) {
-			const checked = task[2]?.toLowerCase() === 'x';
-			out.push({text: `${indentFor(task[1] ?? '')}${checked ? '[x]' : '[ ]'} ${renderInline(task[3]?.trim() ?? '')}`, color: checked ? 'gray' : 'white'});
-			continue;
-		}
-
-		const unordered = unorderedList.exec(line);
-		if (unordered) {
-			out.push({text: `${indentFor(unordered[1] ?? '')}- ${renderInline(unordered[2]?.trim() ?? '')}`, color: 'white'});
-			continue;
-		}
-
-		const ordered = orderedList.exec(line);
-		if (ordered) {
-			out.push({text: `${indentFor(ordered[1] ?? '')}${ordered[2]}. ${renderInline(ordered[3]?.trim() ?? '')}`, color: 'white'});
-			continue;
-		}
-
-		out.push({text: renderInline(line), color: 'white'});
-	}
+	const tokens = marked.lexer(source.replace(/\r\n/g, '\n'));
+	const out = renderTokens(tokens, {indent: '', quote: false});
 
 	while (out.length > 0 && out.at(-1)?.text === '') {
 		out.pop();
 	}
+
 	return out.length > 0 ? out : [{text: ''}];
 }
 
@@ -115,71 +30,188 @@ export function renderMarkdownPlain(source: string) {
 		.trimEnd();
 }
 
-function isHeading(line: string) {
-	return /^#{1,6}\s+/.test(line);
-}
+function renderTokens(tokens: readonly Token[], context: RenderContext): MarkdownLine[] {
+	const out: MarkdownLine[] = [];
 
-function splitHeading(line: string) {
-	const match = /^(#{1,6})\s+(.*)$/.exec(line);
-	const text = (match?.[2]?.trim() ?? line).replace(/\s+#+$/, '').trim();
-	return {level: match?.[1]?.length ?? 1, text};
-}
-
-function isSetextHeading(line: string) {
-	return /^=+$/.test(line) || /^-+$/.test(line);
-}
-
-function isRule(line: string) {
-	return line.length >= 3 && /^[-*_]+$/.test(line);
-}
-
-function isTableRow(line: string) {
-	return line.startsWith('|') && line.endsWith('|') && line.split('|').length >= 3;
-}
-
-function isTableDelimiter(line: string) {
-	if (!isTableRow(line)) {
-		return false;
+	for (const token of tokens) {
+		switch (token.type) {
+			case 'space':
+				pushBlank(out);
+				break;
+			case 'heading':
+				out.push({
+					text: `${context.indent}${context.quote ? '> ' : ''}${inlineText(token.tokens ?? [])}`,
+					color: context.quote ? accentColor : headingColor(token.depth),
+					bold: true
+				});
+				break;
+			case 'paragraph':
+				out.push({
+					text: `${context.indent}${context.quote ? '> ' : ''}${inlineText(token.tokens ?? [])}`,
+					color: context.quote ? accentColor : 'white',
+					bold: context.quote || isStrongOnly(token.tokens ?? [])
+				});
+				break;
+			case 'blockquote':
+				out.push(...renderTokens(token.tokens ?? [], {...context, quote: true}));
+				break;
+			case 'list':
+				if (isListToken(token)) {
+					out.push(...renderList(token, context));
+				}
+				break;
+			case 'code':
+				if (token.lang) {
+					out.push({text: `${context.indent}  ${token.lang}`, color: 'gray'});
+				}
+				for (const line of token.text.split('\n')) {
+					out.push({text: `${context.indent}  ${line}`, color: 'cyan'});
+				}
+				break;
+			case 'table':
+				if (isTableToken(token)) {
+					out.push(...renderTable(token, context));
+				}
+				break;
+			case 'hr':
+				out.push({text: `${context.indent}${'─'.repeat(40)}`, color: 'gray'});
+				break;
+			case 'html':
+				if (token.text.trim()) {
+					out.push({text: `${context.indent}${plainText(token.text)}`, color: 'white'});
+				}
+				break;
+			case 'text':
+				out.push({text: `${context.indent}${inlineText(token.tokens ?? [token])}`, color: 'white'});
+				break;
+			default:
+				break;
+		}
 	}
-	return line
-		.slice(1, -1)
-		.split('|')
-		.every(cell => /^:?-{3,}:?$/.test(cell.trim()));
+
+	return out;
 }
 
-function renderTableRow(line: string) {
-	return line
-		.slice(1, -1)
-		.split('|')
-		.map(cell => renderInline(cell.trim()))
-		.join('  |  ');
+function renderList(token: Tokens.List, context: RenderContext) {
+	const out: MarkdownLine[] = [];
+	const start = typeof token.start === 'number' ? token.start : 1;
+
+	token.items.forEach((item, index) => {
+		const marker = item.task ? `[${item.checked ? 'x' : ' '}]` : token.ordered ? `${start + index}.` : '-';
+		const prefix = `${context.indent}${marker} `;
+		const textLines = itemText(item);
+		const color = item.task && item.checked ? 'gray' : 'white';
+
+		if (textLines.length === 0) {
+			out.push({text: prefix.trimEnd(), color});
+		} else {
+			textLines.forEach((text, lineIndex) => {
+				out.push({
+					text: `${lineIndex === 0 ? prefix : ' '.repeat(prefix.length)}${text}`,
+					color,
+					bold: lineIndex === 0 && isStrongOnly(item.tokens)
+				});
+			});
+		}
+
+		for (const child of nestedBlockTokens(item.tokens)) {
+			out.push(...renderTokens([child], {...context, indent: `${context.indent}  `}));
+		}
+	});
+
+	return out;
 }
 
-function renderInline(value: string) {
-	return value
-		.replace(link, (_match, label: string, target: string) => (label ? `${label} (${target})` : target))
-		.replace(autolink, '$1')
-		.replace(htmlTag, '')
-		.replace(/\\([\\`*_[\]{}()#+\-.!|>])/g, '$1')
-		.replace(/`([^`]+)`/g, '$1')
-		.replace(/\*\*\*([^*]+)\*\*\*/g, '$1')
-		.replace(/___([^_]+)___/g, '$1')
-		.replace(/\*\*([^*]+)\*\*/g, '$1')
-		.replace(/__([^_]+)__/g, '$1')
-		.replace(/\*([^*\n]+)\*/g, '$1')
-		.replace(/_([^_\n]+)_/g, '$1')
-		.replace(/~~([^~]+)~~/g, '$1');
-}
-
-function fenceMarker(line: string) {
-	const match = /^(`{3,}|~{3,})(.*)$/.exec(line);
-	if (!match) {
-		return null;
+function itemText(item: Tokens.ListItem) {
+	const first = item.tokens[0];
+	if (first?.type === 'text') {
+		return inlineText(first.tokens ?? [first]).split('\n');
 	}
-	return {marker: match[1]!, lang: (match[2] ?? '').trim()};
+	if (first?.type === 'paragraph') {
+		return inlineText(first.tokens ?? []).split('\n');
+	}
+	return plainText(item.text).split('\n').filter(Boolean);
 }
 
-function indentFor(raw: string) {
-	const spaces = raw.replace(/\t/g, '    ').length;
-	return ' '.repeat(Math.min(8, Math.floor(spaces / 2) * 2));
+function nestedBlockTokens(tokens: Token[]) {
+	return tokens.filter(token => token.type !== 'text' && token.type !== 'paragraph');
+}
+
+function renderTable(token: Tokens.Table, context: RenderContext) {
+	const rows = [token.header, ...token.rows];
+	const renderedRows = rows.map(row => row.map(cell => inlineText(cell.tokens ?? [])));
+	const widths = renderedRows[0]?.map((_, column) => Math.max(...renderedRows.map(row => stringLength(row[column] ?? '')))) ?? [];
+	const out: MarkdownLine[] = [];
+
+	renderedRows.forEach((row, rowIndex) => {
+		out.push({
+			text: `${context.indent}${row.map((cell, column) => cell.padEnd(widths[column] ?? cell.length)).join('  |  ')}`,
+			color: rowIndex === 0 ? accentColor : 'white',
+			bold: rowIndex === 0
+		});
+	});
+
+	return out;
+}
+
+function inlineText(tokens: readonly Token[]) {
+	return tokens.map(token => inlineTokenText(token)).join('');
+}
+
+function inlineTokenText(token: Token): string {
+	switch (token.type) {
+			case 'strong':
+			case 'em':
+			case 'del':
+				return inlineText(token.tokens ?? []);
+		case 'codespan':
+			return token.text;
+		case 'br':
+			return '\n';
+		case 'link': {
+			const label = inlineText(token.tokens ?? []);
+			return token.href && token.href !== label ? `${label} (${token.href})` : label;
+		}
+		case 'image':
+			return token.href ? `${token.text} (${token.href})` : token.text;
+		case 'html':
+			return plainText(token.text);
+		case 'text':
+			return token.tokens ? inlineText(token.tokens) : token.text;
+		case 'escape':
+			return token.text;
+		default:
+			return 'text' in token && typeof token.text === 'string' ? plainText(token.text) : '';
+	}
+}
+
+function plainText(value: string) {
+	return value.replace(/<\/?[a-z][^>]*>/gi, '');
+}
+
+function isListToken(token: Token): token is Tokens.List {
+	return token.type === 'list' && 'items' in token && Array.isArray(token.items);
+}
+
+function isTableToken(token: Token): token is Tokens.Table {
+	return token.type === 'table' && 'header' in token && Array.isArray(token.header) && 'rows' in token && Array.isArray(token.rows);
+}
+
+function headingColor(level: number) {
+	return level <= 2 ? 'white' : accentColor;
+}
+
+function isStrongOnly(tokens: readonly Token[]) {
+	const meaningful = tokens.filter(token => token.type !== 'space' && token.raw.trim() !== '');
+	return meaningful.length === 1 && meaningful[0]?.type === 'strong';
+}
+
+function pushBlank(lines: MarkdownLine[]) {
+	if (lines.length > 0 && lines.at(-1)?.text !== '') {
+		lines.push({text: ''});
+	}
+}
+
+function stringLength(value: string) {
+	return Array.from(value).length;
 }
