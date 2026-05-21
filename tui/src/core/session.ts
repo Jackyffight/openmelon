@@ -66,7 +66,14 @@ export async function listSessions(workdir: string, limit = 10): Promise<Session
 
 export async function loadSessionHistory(workdir: string, id: string) {
 	const filePath = path.join(sessionsDir(workdir), id, 'messages.jsonl');
-	const body = await fs.readFile(filePath, 'utf8');
+	let body = '';
+	try {
+		body = await fs.readFile(filePath, 'utf8');
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+			throw error;
+		}
+	}
 	return body
 		.split('\n')
 		.map(line => line.trim())

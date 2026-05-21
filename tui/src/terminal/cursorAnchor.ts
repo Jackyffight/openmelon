@@ -1,31 +1,15 @@
+export const cursorAnchorMarker = '\u001B]1337;OpenMelonCursorAnchor\u0007';
+
 export type CursorAnchor = {
 	active: boolean;
 	column: number;
-	rowsToBottom: number;
+	rowFromBottom: number;
 };
 
-let cursorAnchor: CursorAnchor = {
-	active: false,
-	column: 0,
-	rowsToBottom: 0
-};
-
-export function setCursorAnchor(anchor: Omit<CursorAnchor, 'active'>) {
-	cursorAnchor = {
-		active: true,
-		column: Math.max(0, anchor.column),
-		rowsToBottom: Math.max(1, anchor.rowsToBottom)
-	};
+export function markCursorAnchor() {
+	return cursorAnchorMarker;
 }
 
 export function clearCursorAnchor() {
-	cursorAnchor = {
-		active: false,
-		column: 0,
-		rowsToBottom: 0
-	};
-}
-
-export function getCursorAnchor() {
-	return cursorAnchor;
+	return;
 }

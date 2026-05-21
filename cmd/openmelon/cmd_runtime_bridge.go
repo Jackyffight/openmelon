@@ -47,6 +47,9 @@ type bridgeEvent struct {
 	Project          string         `json:"project,omitempty"`
 	Provider         string         `json:"provider,omitempty"`
 	Error            string         `json:"error,omitempty"`
+	Delta            bool           `json:"delta,omitempty"`
+	Markdown         bool           `json:"markdown,omitempty"`
+	Count            int            `json:"count,omitempty"`
 	Detail           map[string]any `json:"detail,omitempty"`
 }
 
@@ -115,7 +118,7 @@ func runRuntimeBridge(args []string) error {
 			}
 			if br.isRunning() {
 				br.addPending(text)
-				br.emit(bridgeEvent{Type: "append", Kind: "info", Text: "queued pending input"})
+				_ = br.session.AppendPrompt("pending", text)
 				continue
 			}
 			br.runTurn(text)
@@ -123,6 +126,7 @@ func runRuntimeBridge(args []string) error {
 			text := strings.TrimSpace(req.Text)
 			if text != "" {
 				br.addPending(text)
+				_ = br.session.AppendPrompt("pending", text)
 			}
 		case "cancel":
 			br.cancelRun()
@@ -282,6 +286,7 @@ func newBridgeRuntime(resume string) (*bridgeRuntime, error) {
 }
 
 func (br *bridgeRuntime) runTurn(text string) {
+	_ = br.session.AppendPrompt("user", text)
 	ctx, cancel := context.WithCancel(context.Background())
 	br.setRunning(cancel)
 	go func() {
@@ -292,6 +297,12 @@ func (br *bridgeRuntime) runTurn(text string) {
 			History:      br.history,
 		})
 		if err != nil {
+			if errors.Is(err, context.Canceled) || strings.Contains(err.Error(), "context canceled") {
+				br.emit(bridgeEvent{Type: "append", Kind: "error", Text: "interrupted"})
+				br.emit(bridgeEvent{Type: "status", Status: "error", Activity: "Interrupted"})
+				br.emit(bridgeEvent{Type: "done"})
+				return
+			}
 			br.emitError(err)
 			br.emit(bridgeEvent{Type: "status", Status: "error", Activity: "Error"})
 			br.emit(bridgeEvent{Type: "done"})
@@ -497,6 +508,9 @@ func (br *bridgeRuntime) drainPending() []string {
 	defer br.pendingMu.Unlock()
 	out := append([]string(nil), br.pending...)
 	br.pending = nil
+	if len(out) > 0 {
+		br.emit(bridgeEvent{Type: "pending-applied", Count: len(out)})
+	}
 	return out
 }
 
@@ -585,7 +599,7 @@ func (t *bridgeTracer) OnTurnStart(turn int) {
 }
 
 func (t *bridgeTracer) OnText(delta string) {
-	t.br().emit(bridgeEvent{Type: "append", Kind: "assistant", Text: delta})
+	t.br().emit(bridgeEvent{Type: "append", Kind: "assistant", Text: delta, Delta: true, Markdown: true})
 }
 
 func (t *bridgeTracer) OnToolCall(call llm.ToolCall) {

@@ -26,7 +26,7 @@ export async function inspectBootstrap(): Promise<BootstrapState> {
 	const globallyConfiguredKey = Object.keys(credentials.api_keys ?? {}).length > 0;
 
 	if (!workdir) {
-		const needsTrust = !isTrusted(config, cwd);
+		const needsTrust = !(await isTrusted(config, cwd));
 		const provider = config.defaults?.llm_provider || 'openrouter';
 		const model = config.defaults?.llm_model || 'openai/gpt-5.5';
 		const reasoning = config.defaults?.reasoning_effort || 'xhigh';
@@ -56,7 +56,7 @@ export async function inspectBootstrap(): Promise<BootstrapState> {
 
 	const project = await loadProject(workdir);
 	let needsTrust = false;
-	if (!isTrusted(config, cwd)) {
+	if (!(await isTrusted(config, cwd))) {
 		needsTrust = true;
 		issues.push(`trust ${cwd} before OpenMelon reads project files`);
 	}

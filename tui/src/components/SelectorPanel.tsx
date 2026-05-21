@@ -16,16 +16,17 @@ type Props = {
 	rows: SelectorRow[];
 	active: number;
 	footer?: string;
+	compact?: boolean;
 };
 
-export function SelectorPanel({title, description, rows, active, footer}: Props) {
+export function SelectorPanel({title, description, rows, active, footer, compact = false}: Props) {
 	return (
 		<Box flexDirection="column" marginTop={1} marginBottom={1}>
 			<Text bold>{title}</Text>
 			{description && <Text color="gray">{description}</Text>}
 			<Text> </Text>
 			{rows.map((row, index) => (
-				<Box key={row.id || row.title} flexDirection="column" marginBottom={1}>
+				<Box key={row.id || row.title} flexDirection="column" marginBottom={compact ? 0 : 1}>
 					<Text color={index === active ? accentColor : row.disabled ? 'gray' : 'white'} bold={index === active}>
 						{index === active ? '› ' : '  '}
 						{index + 1}. {row.title}

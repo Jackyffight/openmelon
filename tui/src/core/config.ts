@@ -41,6 +41,15 @@ export async function saveUserConfig(config: UserConfig) {
 	await writeJsonFile(path.join(openmelonHome(), 'config.json'), config);
 }
 
+export async function markProjectUsed(id: string) {
+	const projects = await loadProjects();
+	const entry = projects.entries.find(item => item.id === id);
+	if (entry) {
+		entry.last_used_at = new Date().toISOString();
+		await saveProjects(projects);
+	}
+}
+
 export async function loadCredentials() {
 	return readJsonFile<Credentials>(path.join(openmelonHome(), 'credentials.json'), {api_keys: {}});
 }
@@ -60,12 +69,18 @@ export async function saveProjects(projects: ProjectsConfig) {
 	await writeJsonFile(path.join(openmelonHome(), 'projects.json'), projects);
 }
 
-export function isTrusted(config: UserConfig, candidate: string) {
+export async function isTrusted(config: UserConfig, candidate: string) {
 	const current = path.resolve(candidate);
+	const currentReal = await realpathBestEffort(current);
 	for (const dir of config.trusted_dirs ?? []) {
 		const trusted = path.resolve(dir);
-		const rel = path.relative(trusted, current);
-		if (rel === '' || (rel !== '..' && !rel.startsWith(`..${path.sep}`))) {
+		const trustedReal = await realpathBestEffort(trusted);
+		if (
+			sameOrSubdir(trusted, current) ||
+			sameOrSubdir(trustedReal, currentReal) ||
+			sameOrSubdir(trusted, currentReal) ||
+			sameOrSubdir(trustedReal, current)
+		) {
 			return true;
 		}
 	}
@@ -75,9 +90,10 @@ export function isTrusted(config: UserConfig, candidate: string) {
 export async function addTrustedDir(candidate: string) {
 	const config = await loadUserConfig();
 	const abs = path.resolve(candidate);
+	const canonical = await realpathBestEffort(abs);
 	const trusted = config.trusted_dirs ?? [];
-	if (!trusted.includes(abs)) {
-		config.trusted_dirs = [...trusted, abs];
+	if (!(await isTrusted(config, canonical))) {
+		config.trusted_dirs = [...trusted, canonical];
 		await saveUserConfig(config);
 	}
 }
@@ -85,7 +101,7 @@ export async function addTrustedDir(candidate: string) {
 export async function registerProject(id: string, name: string, workdir: string, options: {setCurrent?: boolean} = {}) {
 	const projects = await loadProjects();
 	const now = new Date().toISOString();
-	const abs = path.resolve(workdir);
+	const abs = await realpathBestEffort(path.resolve(workdir));
 	const existing = projects.entries.find(entry => entry.id === id);
 	if (existing) {
 		existing.name = name;
@@ -101,6 +117,25 @@ export async function registerProject(id: string, name: string, workdir: string,
 	const config = await loadUserConfig();
 	config.current_project = id;
 	await saveUserConfig(config);
+}
+
+async function realpathBestEffort(candidate: string) {
+	try {
+		return await fs.realpath(candidate);
+	} catch {
+		return candidate;
+	}
+}
+
+function sameOrSubdir(parent: string, child: string) {
+	if (!parent || !child) {
+		return false;
+	}
+	if (child === parent) {
+		return true;
+	}
+	const rel = path.relative(parent, child);
+	return rel !== '' && rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
 }
 
 export function providerApiKeyEnv(provider: string) {

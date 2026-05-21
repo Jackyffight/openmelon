@@ -1,4 +1,6 @@
-import {getCursorAnchor} from './cursorAnchor.js';
+import ansiRegex from 'ansi-regex';
+import stringWidth from 'string-width';
+import {cursorAnchorMarker} from './cursorAnchor.js';
 
 const esc = '\u001B[';
 const cursorLeft = `${esc}G`;
@@ -23,7 +25,7 @@ export function createAnchoredStdout(stdout: NodeJS.WriteStream): NodeJS.WriteSt
 	}
 
 	let anchored = false;
-	let anchoredRowsToBottom = 0;
+	let anchorRowFromBottom = 0;
 
 	const proxy = new Proxy(stdout, {
 		get(target, property, receiver) {
@@ -35,20 +37,47 @@ export function createAnchoredStdout(stdout: NodeJS.WriteStream): NodeJS.WriteSt
 			return (chunk: unknown, encodingOrCallback?: BufferEncoding | ((error?: Error | null) => void), callback?: (error?: Error | null) => void) => {
 				const encoding = typeof encodingOrCallback === 'string' ? encodingOrCallback : undefined;
 				const done = typeof encodingOrCallback === 'function' ? encodingOrCallback : callback;
-				const text = Buffer.isBuffer(chunk) ? chunk.toString(encoding) : String(chunk);
-				const restore = anchored ? `${cursorDown(anchoredRowsToBottom)}${cursorLeft}` : '';
-				const anchor = getCursorAnchor();
-				const place = anchor.active
-					? `${cursorShow}${steadyBarCursor}${cursorUp(anchor.rowsToBottom)}${cursorToColumn(anchor.column)}`
+				const raw = Buffer.isBuffer(chunk) ? chunk.toString(encoding) : String(chunk);
+				const rendered = extractCursorAnchor(raw);
+				const restore = anchored ? `${cursorDown(anchorRowFromBottom)}${cursorLeft}` : '';
+				const place = rendered.anchor
+					? `${cursorShow}${steadyBarCursor}${cursorUp(rendered.anchor.rowFromBottom)}${cursorToColumn(rendered.anchor.column)}`
 					: cursorShow;
 
-				anchored = anchor.active;
-				anchoredRowsToBottom = anchor.rowsToBottom;
+				anchored = Boolean(rendered.anchor);
+				anchorRowFromBottom = rendered.anchor?.rowFromBottom ?? 0;
 
-				return target.write(`${restore}${text}${place}`, done);
+				return target.write(`${restore}${rendered.text}${place}`, done);
 			};
 		}
 	});
 
 	return proxy as NodeJS.WriteStream;
+}
+
+function extractCursorAnchor(text: string) {
+	const markerIndex = text.indexOf(cursorAnchorMarker);
+	if (markerIndex < 0) {
+		return {text};
+	}
+
+	const before = text.slice(0, markerIndex);
+	const after = text.slice(markerIndex + cursorAnchorMarker.length);
+	const lines = before.split('\n');
+	const row = lines.length - 1;
+	const column = stringWidth(stripAnsi(lines.at(-1) ?? ''));
+	const totalRows = before.split('\n').length + after.split('\n').length - 1;
+	const rowFromBottom = Math.max(0, totalRows - row - 1);
+
+	return {
+		text: `${before}${after}`,
+		anchor: {
+			column,
+			rowFromBottom
+		}
+	};
+}
+
+function stripAnsi(text: string) {
+	return text.replace(ansiRegex(), '');
 }

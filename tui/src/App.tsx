@@ -6,8 +6,9 @@ import {PromptInput} from './components/PromptInput.js';
 import {SelectorPanel, type SelectorRow} from './components/SelectorPanel.js';
 import {SlashPalette} from './components/SlashPalette.js';
 import {StatusLine} from './components/StatusLine.js';
-import {Transcript} from './components/Transcript.js';
-import {createRuntimeBridge, type RuntimeBridge, type RuntimeEvent} from './runtime/processBridge.js';
+import {Transcript, transcriptItemPlainText} from './components/Transcript.js';
+import {WorkingLine} from './components/WorkingLine.js';
+import {createRuntimeClient, type RuntimeClient, type RuntimeEvent} from './runtime/index.js';
 import {randomPlaceholder} from './placeholder.js';
 import {initialState, reducer} from './state/reducer.js';
 import {discoverProject} from './core/project.js';
@@ -24,6 +25,8 @@ import type {TuiAction, TuiState, TranscriptItem} from './state/types.js';
 
 type Props = {
 	resumeId?: string;
+	initialPrompt?: string;
+	onSessionInfo?: (info: {sessionId?: string; sessionDir?: string}) => void;
 };
 
 type Overlay =
@@ -32,7 +35,7 @@ type Overlay =
 	| {kind: 'settings'; cursor: number}
 	| {kind: 'skill'; cursor: number; skills: SkillInfo[]; error: string}
 	| {kind: 'custom-model'; cursor: number; image: boolean; input: string}
-	| {kind: 'approval'; cursor: number; id: string; tool: string; command: string; description: string; binary: string};
+	| {kind: 'approval'; cursor: number; scroll: number; id: string; tool: string; command: string; description: string; binary: string};
 
 type Dispatch = React.Dispatch<TuiAction>;
 
@@ -42,16 +45,17 @@ type OverlayRow = SelectorRow & {
 	section?: boolean;
 };
 
-export function App({resumeId}: Props) {
+export function App({resumeId, initialPrompt, onSessionInfo}: Props) {
 	const {exit} = useApp();
 	const {stdout} = useStdout();
 	const width = Math.max(32, stdout.columns ?? 88);
 	const [state, dispatch] = useReducer(reducer, undefined, initialState);
 	const placeholder = useMemo(() => randomPlaceholder(), []);
 	const [running, setRunning] = useState(false);
+	const [, setClock] = useState(0);
 	const [bootstrap, setBootstrap] = useState<BootstrapState | null>(null);
 	const [overlay, setOverlay] = useState<Overlay | null>(null);
-	const runtimeBridge = useRef<RuntimeBridge | null>(null);
+	const runtimeBridge = useRef<RuntimeClient | null>(null);
 	const stateRef = useRef(state);
 	const submittedRef = useRef(false);
 
@@ -95,6 +99,7 @@ export function App({resumeId}: Props) {
 	const handleRuntimeEvent = useCallback((event: RuntimeEvent) => {
 		switch (event.type) {
 			case 'ready':
+				onSessionInfo?.({sessionId: event.sessionId, sessionDir: event.sessionDir});
 				dispatch({
 					type: 'runtime-ready',
 					model: event.model,
@@ -109,11 +114,19 @@ export function App({resumeId}: Props) {
 			case 'append':
 				if (event.kind === 'error' && stateRef.current.items.length === 0 && !submittedRef.current) {
 					dispatch({type: 'notice', notice: event.text});
+				} else if (event.delta) {
+					dispatch({type: 'append-delta', kind: event.kind, text: event.text, markdown: event.markdown ?? event.kind === 'assistant'});
 				} else {
 					dispatch({type: 'append', kind: event.kind, text: event.text});
 				}
 				break;
+			case 'pending-applied':
+				dispatch({type: 'pending-applied', count: event.count});
+				break;
 			case 'status':
+				if ((event.status === 'thinking' || event.status === 'tool') && !stateRef.current.runStartedAt) {
+					dispatch({type: 'turn-started', at: Date.now()});
+				}
 				dispatch({type: 'status', status: event.status, activity: event.activity});
 				if (event.status === 'ready' || event.status === 'error') {
 					setRunning(false);
@@ -130,6 +143,7 @@ export function App({resumeId}: Props) {
 				setOverlay({
 					kind: 'approval',
 					cursor: 0,
+					scroll: 0,
 					id: event.detail?.id ?? '',
 					tool: event.detail?.tool ?? 'tool',
 					command: event.detail?.command ?? '',
@@ -140,7 +154,6 @@ export function App({resumeId}: Props) {
 				break;
 			case 'done':
 				setRunning(false);
-				dispatch({type: 'drain-pending'});
 				break;
 			case 'error':
 				dispatch({type: 'append', kind: 'error', text: event.error});
@@ -153,15 +166,15 @@ export function App({resumeId}: Props) {
 		if (!bootstrap?.ready) {
 			return;
 		}
-		runtimeBridge.current = createRuntimeBridge(handleRuntimeEvent, {resumeId});
+		runtimeBridge.current = createRuntimeClient(handleRuntimeEvent, {resumeId, initialPrompt});
 		return () => runtimeBridge.current?.shutdown();
-	}, [bootstrap?.ready, handleRuntimeEvent, resumeId]);
+	}, [bootstrap?.ready, handleRuntimeEvent, initialPrompt, resumeId]);
 
 	const reloadRuntime = useCallback(() => {
 		if (runtimeBridge.current?.isAvailable()) {
 			runtimeBridge.current.reload();
 		} else {
-			runtimeBridge.current = createRuntimeBridge(handleRuntimeEvent, {resumeId});
+			runtimeBridge.current = createRuntimeClient(handleRuntimeEvent, {resumeId});
 		}
 	}, [handleRuntimeEvent, resumeId]);
 
@@ -186,7 +199,7 @@ export function App({resumeId}: Props) {
 			}
 			dispatch({type: 'append', kind: 'info', text: 'continue below'});
 		})().catch(error => {
-			dispatch({type: 'append', kind: 'error', text: `resume: ${(error as Error).message}`});
+			dispatch({type: 'append', kind: 'info', text: `resume ${resumeId} unavailable; starting fresh. ${(error as Error).message}`});
 		});
 		return () => {
 			cancelled = true;
@@ -202,9 +215,19 @@ export function App({resumeId}: Props) {
 	}, [filteredCommands.length, state.paletteIndex]);
 
 	const startTurn = useCallback((text: string) => {
+		submittedRef.current = true;
 		setRunning(true);
+		dispatch({type: 'turn-started', at: Date.now()});
 		runtimeBridge.current?.run(text);
 	}, []);
+
+	useEffect(() => {
+		if (!running) {
+			return;
+		}
+		const timer = setInterval(() => setClock(value => value + 1), 1000);
+		return () => clearInterval(timer);
+	}, [running]);
 
 	const submit = useCallback((raw: string) => {
 		let text = raw.trim();
@@ -212,13 +235,13 @@ export function App({resumeId}: Props) {
 			return;
 		}
 
-		submittedRef.current = true;
-		dispatch({type: 'submit-start', text});
-
 		if (matchesExit(text)) {
 			runtimeBridge.current?.shutdown();
 			exit();
 			return;
+		}
+		if (text.startsWith('/')) {
+			dispatch({type: 'clear-input', remember: true});
 		}
 		if (text === '/help' || text === '/?') {
 			dispatch({
@@ -239,6 +262,7 @@ export function App({resumeId}: Props) {
 			return;
 		}
 		if (text === '/clear') {
+			submittedRef.current = false;
 			dispatch({type: 'clear-transcript'});
 			runtimeCommand(runtimeBridge.current, dispatch, bridge => bridge.clearHistory());
 			return;
@@ -338,6 +362,7 @@ export function App({resumeId}: Props) {
 			return;
 		}
 
+		const visibleText = text;
 		const skill = stateRef.current.activeSkill;
 		if (skill) {
 			text = `Apply the skill "${skill}" to this request: first call compile_skill with skill="${skill}" (BARE slug, no 'skillplus:' prefix) to fetch the package's prompt + output schema, then proceed.\n\n${text}`;
@@ -345,13 +370,17 @@ export function App({resumeId}: Props) {
 		}
 
 		if (running) {
+			dispatch({type: 'commit-input', text: visibleText});
+			submittedRef.current = true;
 			dispatch({type: 'queue-pending', text});
-			dispatch({type: 'append', kind: 'info', text: `queued pending input: ${text}`});
-			runtimeBridge.current?.pending(text);
+			dispatch({type: 'append', kind: 'info', text: 'queued pending input'});
+			runtimeBridge.current?.run(text);
 			return;
 		}
 
-		if (runtimeBridge.current && !runtimeBridge.current.isAvailable()) {
+		dispatch({type: 'commit-input', text: visibleText});
+
+		if (!runtimeBridge.current || !runtimeBridge.current.isAvailable()) {
 			dispatch({type: 'append', kind: 'error', text: stateRef.current.notice || 'runtime unavailable'});
 			return;
 		}
@@ -394,12 +423,30 @@ export function App({resumeId}: Props) {
 			}
 			if (overlay.kind === 'approval') {
 				const rows = approvalRows(overlay);
+				const bodyRows = approvalBodyRows();
+				const maxScroll = approvalMaxScroll(overlay, bodyRows);
 				if (key.upArrow || chunk === 'k') {
 					setOverlay({...overlay, cursor: Math.max(0, overlay.cursor - 1)});
 					return;
 				}
 				if (key.downArrow || chunk === 'j') {
 					setOverlay({...overlay, cursor: Math.min(rows.length - 1, overlay.cursor + 1)});
+					return;
+				}
+				if (key.pageUp || (key.ctrl && chunk === 'u')) {
+					setOverlay({...overlay, scroll: Math.max(0, overlay.scroll - bodyRows)});
+					return;
+				}
+				if (key.pageDown || (key.ctrl && chunk === 'd')) {
+					setOverlay({...overlay, scroll: Math.min(maxScroll, overlay.scroll + bodyRows)});
+					return;
+				}
+				if (isHomeKey(chunk)) {
+					setOverlay({...overlay, scroll: 0});
+					return;
+				}
+				if (isEndKey(chunk)) {
+					setOverlay({...overlay, scroll: maxScroll});
 					return;
 				}
 				if (key.escape || chunk === 'n' || chunk === 'N') {
@@ -498,6 +545,12 @@ export function App({resumeId}: Props) {
 		}
 
 		if (key.ctrl && chunk === 'c') {
+			if (running) {
+				runtimeBridge.current?.cancel();
+				setRunning(false);
+				dispatch({type: 'status', status: 'error', activity: 'Interrupted'});
+				return;
+			}
 			if (current.input.trim().length > 0) {
 				dispatch({type: 'clear-input', notice: 'input cleared', remember: true});
 				return;
@@ -512,7 +565,19 @@ export function App({resumeId}: Props) {
 			return;
 		}
 
+		if (key.ctrl && chunk === 'd') {
+			runtimeBridge.current?.shutdown();
+			exit();
+			return;
+		}
+
 		if (key.escape) {
+			if (running) {
+				runtimeBridge.current?.cancel();
+				setRunning(false);
+				dispatch({type: 'status', status: 'error', activity: 'Interrupted'});
+				return;
+			}
 			if (current.input.trim().length > 0) {
 				dispatch({type: 'clear-input', notice: 'input cleared', remember: true});
 			} else {
@@ -584,7 +649,8 @@ export function App({resumeId}: Props) {
 		<Box flexDirection="column">
 			<HeaderCard state={state} />
 			<Transcript items={state.items} width={width} />
-			<Box flexDirection="column" marginTop={1}>
+			<WorkingLine state={state} />
+			<Box flexDirection="column">
 				{overlay ? (
 					<SelectorPanel {...overlayView(overlay, bootstrap, state)} />
 				) : filteredCommands.length > 0 ? (
@@ -613,6 +679,14 @@ function isShiftEnter(chunk: string, key: {return?: boolean; shift?: boolean}) {
 		/^\u001B\[(?:10|13);2~$/.test(chunk) ||
 		/^\u001B\[27;2;(?:10|13)~$/.test(chunk)
 	);
+}
+
+function isHomeKey(chunk: string) {
+	return chunk === '\u001B[H' || chunk === '\u001B[1~' || chunk === '\u001BOH';
+}
+
+function isEndKey(chunk: string) {
+	return chunk === '\u001B[F' || chunk === '\u001B[4~' || chunk === '\u001BOF';
 }
 
 function normalizeTextInput(chunk: string) {
@@ -712,12 +786,12 @@ function transcriptText(items: TranscriptItem[]) {
 	return items
 		.map(item => {
 			const label = item.kind === 'assistant' ? 'assistant' : item.kind;
-			return `[${label}] ${item.text}`;
+			return `[${label}] ${transcriptItemPlainText(item)}`;
 		})
 		.join('\n\n');
 }
 
-function runtimeCommand(bridge: RuntimeBridge | null, dispatch: Dispatch, run: (bridge: RuntimeBridge) => void) {
+function runtimeCommand(bridge: RuntimeClient | null, dispatch: Dispatch, run: (bridge: RuntimeClient) => void) {
 	if (!bridge || !bridge.isAvailable()) {
 		dispatch({type: 'append', kind: 'error', text: 'runtime unavailable'});
 		return;
@@ -882,12 +956,23 @@ function overlayView(overlay: Overlay, bootstrap: BootstrapState, state: TuiStat
 		};
 	}
 	if (overlay.kind === 'approval') {
+		const bodyRows = approvalBodyRows();
+		const detail = approvalDetailText(overlay);
+		const lines = detail.split('\n');
+		const max = approvalMaxScroll(overlay, bodyRows);
+		const start = Math.min(overlay.scroll, max);
+		const end = Math.min(lines.length, start + bodyRows);
+		const description =
+			lines.length > bodyRows
+				? `Details ${start + 1}-${end}/${lines.length} · PgUp/PgDn scroll\n\n${lines.slice(start, end).join('\n')}`
+				: detail;
 		return {
-			title: `Do you want to run ${overlay.tool}?`,
-			description: [overlay.description, overlay.command].filter(Boolean).join('\n\n'),
+			title: `Bash approval required: ${overlay.tool}`,
+			description,
 			rows: approvalRows(overlay),
 			active: overlay.cursor,
-			footer: 'Enter to confirm · y=yes · n=no · Esc=no · 1/2/3 shortcut'
+			footer: 'Enter confirm · Esc deny · 1/2/3 shortcut · PgUp/PgDn details',
+			compact: true
 		};
 	}
 	if (overlay.kind === 'custom-model') {
@@ -1010,12 +1095,31 @@ function commitSkillRow(row: OverlayRow, dispatch: Dispatch) {
 function approvalRows(overlay: Extract<Overlay, {kind: 'approval'}>): OverlayRow[] {
 	return [
 		{id: 'yes', value: 'yes', title: 'Yes'},
-		{id: 'always', value: 'always', title: `Yes, always allow \`${overlay.binary || 'this binary'}\` this session`},
+		{id: 'always', value: 'always', title: `Yes, always allow \`${overlay.binary || 'this binary'}\` in this project`},
 		{id: 'no', value: 'no', title: 'No'}
 	];
 }
 
-function answerApproval(bridge: RuntimeBridge | null, overlay: Extract<Overlay, {kind: 'approval'}>, index: number) {
+function approvalDetailText(overlay: Extract<Overlay, {kind: 'approval'}>) {
+	const parts: string[] = [];
+	if (overlay.description.trim()) {
+		parts.push(`Reason\n${overlay.description.trim()}`);
+	}
+	if (overlay.command.trim()) {
+		parts.push(`Command\n${overlay.command.trim()}`);
+	}
+	return parts.join('\n\n') || 'Review the command before approving.';
+}
+
+function approvalBodyRows() {
+	return 8;
+}
+
+function approvalMaxScroll(overlay: Extract<Overlay, {kind: 'approval'}>, bodyRows = approvalBodyRows()) {
+	return Math.max(0, approvalDetailText(overlay).split('\n').length - bodyRows);
+}
+
+function answerApproval(bridge: RuntimeClient | null, overlay: Extract<Overlay, {kind: 'approval'}>, index: number) {
 	switch (index) {
 		case 0:
 			bridge?.approval(overlay.id, true, false);

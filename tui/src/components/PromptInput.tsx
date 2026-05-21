@@ -1,8 +1,7 @@
 import React from 'react';
 import {Box, Text} from 'ink';
-import stringWidth from 'string-width';
 import {accentColor} from '../theme.js';
-import {setCursorAnchor} from '../terminal/cursorAnchor.js';
+import {markCursorAnchor} from '../terminal/cursorAnchor.js';
 import {wrapBlock} from '../terminal/wrap.js';
 
 type Props = {
@@ -14,20 +13,25 @@ type Props = {
 export function PromptInput({input, placeholder, width}: Props) {
 	const prompt = '› ';
 	const rightBuffer = 6;
-	const available = Math.max(12, width - stringWidth(prompt) - rightBuffer);
+	const available = Math.max(12, width - 2 - rightBuffer);
 	const lines = input.length === 0 ? [''] : wrapBlock(input, available);
-	const lastLine = lines.at(-1) ?? '';
-	setCursorAnchor({
-		column: stringWidth(prompt) + stringWidth(lastLine),
-		rowsToBottom: 2
-	});
 
 	return (
-		<Box flexDirection="column">
+		<Box flexDirection="column" marginTop={1}>
 			{lines.map((line, index) => (
 				<Box key={index}>
 					<Text color={accentColor}>{index === 0 ? prompt : '  '}</Text>
-					<Text color={input.length === 0 ? 'gray' : 'white'}>{input.length === 0 ? ` ${placeholder}` : line}</Text>
+					{input.length === 0 ? (
+						<Text color="gray">
+							{markCursorAnchor()}
+							{` ${placeholder}`}
+						</Text>
+					) : (
+						<Text color="white">
+							{line}
+							{index === lines.length - 1 ? markCursorAnchor() : ''}
+						</Text>
+					)}
 				</Box>
 			))}
 		</Box>

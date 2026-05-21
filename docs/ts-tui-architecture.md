@@ -1,16 +1,14 @@
 # TS-First TUI Architecture
 
-OpenMelon's product TUI is moving to TypeScript and Ink. The goal is not to
-replace the creator runtime in this step; it is to make the terminal experience
-stable enough to become the main product surface.
+OpenMelon's product TUI and default creator runtime are now TypeScript and Ink.
+The goal is one product entrypoint that does not require non-TS runtimes.
 
 ## Decision
 
-The TUI should be implemented as a TS/Ink application and installed as the
-user-facing `openmelon` command when this migration is complete.
-
-Go remains the current runtime reference. Rust TUI work is kept as a prototype
-and comparison point, but it is no longer the primary UI direction.
+The user-facing `openmelon` command is the TS package under `tui/`. Historical
+non-TS implementations must not be on the installed command path, and the
+installed command, TUI, runtime, and common project commands must not spawn
+non-TS binaries.
 
 ## Why
 
@@ -40,7 +38,11 @@ The production TUI package lives in `tui/`.
 - `src/App.tsx` owns the UI state machine and key handling
 - `src/components/` contains visual components
 - `src/state/` contains reducer/state types
-- `src/runtime/processBridge.ts` talks to the Go runtime bridge over JSONL
+- `src/runtime/nativeClient.ts` runs the TS-native agent loop
+- `src/runtime/openaiCompat.ts` implements OpenAI-compatible and Anthropic
+  streaming tool calls
+- `src/commands/` contains TS-native project, registry, search, session, and
+  continuity-space CLI commands
 - `bin/openmelon.js` launches built JS when available, or TS source through
   `tsx` in development
 
@@ -60,18 +62,15 @@ make tui-install
 
 ## Runtime Boundary
 
-The product boundary is a JSONL process bridge:
+The product boundary is an in-process TS runtime client:
 
 - TS owns the terminal UI, onboarding screens, slash palette, input behavior,
-  and normal scrollback rendering.
-- Go owns the creator runtime, tool registry, session persistence, approvals,
-  model calls, image generation, and continuity tools.
-- The bridge process is launched as `openmelon runtime-bridge [resume-id]`.
-- Resume ids must be passed into the bridge, not only rendered by the UI, so
-  the next model call receives the loaded message history.
-- Runtime configuration changes use `reload` instead of killing the bridge.
-  This preserves in-memory conversation history, pending input, the current
-  session directory, and per-session bash allowlists.
+  normal scrollback rendering, and creator runtime.
+- The native runtime owns tool registry, session persistence, approvals, model
+  calls, image generation, and continuity tools.
+- Runtime configuration changes use `reload` so the active runtime sees the new
+  settings without losing the session.
+- `runtime-bridge` and process fallback are retired in the TS entrypoint.
 
 The UI expects runtime events shaped like:
 
@@ -88,9 +87,9 @@ Input flows the other direction:
 - if the run has already ended, pending input starts a new run immediately
 - `/clear`, `/history`, and `/save` are runtime commands, not transcript-only
   UI commands. They operate on the LLM message history.
-- `/model`, `/model-image`, and `/settings` persist to project config and then
-  call bridge `reload` so the active runtime sees the new settings without
-  losing the session.
+- `/model`, `/model-image`, and `/settings` persist to project config and call
+  runtime `reload` so the active runtime sees the new settings without losing
+  the session.
 
-This keeps the TUI independent from whether the runtime remains Go, moves to TS,
-or runs as a separate native process.
+This keeps the product path TS-native while allowing old non-TS code to be
+inspected separately during migration.

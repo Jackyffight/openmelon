@@ -22,6 +22,9 @@ export function initialState(): TuiState {
 		activeSkill: '',
 		promptTokens: 0,
 		completionTokens: 0,
+		totalPromptTokens: 0,
+		totalCompletionTokens: 0,
+		runStartedAt: null,
 		nextId: 1
 	};
 }
@@ -31,9 +34,32 @@ export function reducer(state: TuiState, action: TuiAction): TuiState {
 		case 'append':
 			return {
 				...state,
-				items: [...state.items, {id: state.nextId, kind: action.kind, text: action.text}],
+				items: [...state.items, {id: state.nextId, kind: action.kind, text: action.text, markdown: action.kind === 'assistant'}],
 				nextId: state.nextId + 1
 			};
+		case 'append-delta': {
+			const last = state.items.at(-1);
+			if (last && last.kind === action.kind && Boolean(last.markdown) === Boolean(action.markdown)) {
+				return {
+					...state,
+					items: [
+						...state.items.slice(0, -1),
+						{
+							...last,
+							text: `${last.text}${action.text}`
+						}
+					]
+				};
+			}
+			return {
+				...state,
+				items: [
+					...state.items,
+					{id: state.nextId, kind: action.kind, text: action.text, markdown: action.markdown ?? action.kind === 'assistant'}
+				],
+				nextId: state.nextId + 1
+			};
+		}
 		case 'set-input':
 			return {...state, input: action.input, historyIndex: null, notice: ''};
 		case 'insert':
@@ -60,6 +86,7 @@ export function reducer(state: TuiState, action: TuiAction): TuiState {
 				notice: action.notice ?? ''
 			};
 		}
+		case 'commit-input':
 		case 'submit-start': {
 			const inputHistory =
 				action.text.trim() !== '' && state.inputHistory.at(-1) !== action.text
@@ -125,10 +152,22 @@ export function reducer(state: TuiState, action: TuiAction): TuiState {
 				pendingInputs: [...state.pendingInputs, action.text],
 				notice: `${state.pendingInputs.length + 1} pending input`
 			};
+		case 'pending-applied': {
+			const count = Math.max(0, action.count);
+			return {
+				...state,
+				pendingInputs: count >= state.pendingInputs.length ? [] : state.pendingInputs.slice(count)
+			};
+		}
 		case 'drain-pending':
 			return {...state, pendingInputs: []};
 		case 'status':
-			return {...state, status: action.status, activity: action.activity ?? state.activity};
+			return {
+				...state,
+				status: action.status,
+				activity: action.activity ?? state.activity,
+				runStartedAt: action.status === 'ready' || action.status === 'error' ? null : state.runStartedAt
+			};
 		case 'notice':
 			return {...state, notice: action.notice};
 		case 'arm-quit':
@@ -137,8 +176,12 @@ export function reducer(state: TuiState, action: TuiAction): TuiState {
 			return {
 				...state,
 				promptTokens: action.promptTokens,
-				completionTokens: action.completionTokens
+				completionTokens: action.completionTokens,
+				totalPromptTokens: state.totalPromptTokens + action.promptTokens,
+				totalCompletionTokens: state.totalCompletionTokens + action.completionTokens
 			};
+		case 'turn-started':
+			return {...state, runStartedAt: action.at};
 		case 'runtime-ready':
 			return {
 				...state,

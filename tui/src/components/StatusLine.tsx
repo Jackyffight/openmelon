@@ -10,13 +10,12 @@ type Props = {
 
 export function StatusLine({state, width}: Props) {
 	const tokens =
-		state.promptTokens > 0 || state.completionTokens > 0
-			? ` · ${formatTokenCount(state.promptTokens)} in / ${formatTokenCount(state.completionTokens)} out`
+		state.totalPromptTokens > 0 || state.totalCompletionTokens > 0
+			? ` · ${formatTokenCount(state.totalPromptTokens)} in / ${formatTokenCount(state.totalCompletionTokens)} out`
 			: '';
 	const pending = state.pendingInputs.length > 0 ? ` · ${state.pendingInputs.length} pending` : '';
-	const left = `${state.activity} · ${state.model} · ${state.reasoning} · ${state.project}${tokens}${pending}`;
-	const right =
-		state.notice || 'Tip: use vbox-cli to publish generated posts and let global audiences see your ideas.';
+	const left = `${state.model}${state.reasoning ? ` ${state.reasoning}` : ''} · ${state.project}${tokens}${pending}`;
+	const right = state.notice || 'vbox-cli can publish generated posts';
 	const line = formatStatusLine(left, right, width);
 
 	return (
@@ -33,7 +32,7 @@ export function StatusLine({state, width}: Props) {
 
 function formatStatusLine(left: string, right: string, width: number) {
 	const columns = Math.max(24, width);
-	const rightMax = Math.max(0, Math.min(right.length, Math.floor(columns * 0.45)));
+	const rightMax = Math.max(0, Math.min(right.length, Math.floor(columns * 0.36)));
 	const trimmedRight = truncateStart(right, rightMax);
 	const leftMax = Math.max(0, columns - trimmedRight.length);
 	const trimmedLeft = truncateEnd(left, leftMax);
