@@ -8,26 +8,27 @@ import {wrapBlock} from '../terminal/wrap.js';
 type Props = {
 	items: TranscriptItem[];
 	width: number;
+	maxRenderedLines?: number;
 };
 
-export function Transcript({items, width}: Props) {
+export function Transcript({items, width, maxRenderedLines}: Props) {
 	return (
 		<Box flexDirection="column">
 			{items.map(item => (
-				<TranscriptBlock key={item.id} item={item} width={width} />
+				<TranscriptBlock key={item.id} item={item} width={width} maxRenderedLines={maxRenderedLines} />
 			))}
 		</Box>
 	);
 }
 
-function TranscriptBlock({item, width}: {item: TranscriptItem; width: number}) {
+function TranscriptBlock({item, width, maxRenderedLines}: {item: TranscriptItem; width: number; maxRenderedLines?: number}) {
 	if (item.markdown) {
-		return <MarkdownBlock item={item} width={width} />;
+		return <MarkdownBlock item={item} width={width} maxRenderedLines={maxRenderedLines} />;
 	}
 	const color = colorForKind(item.kind);
 	const prefixWidth = gutterWidth(item.kind);
 	const rightBuffer = 8;
-	const lines = wrapBlock(cleanTextForKind(item.kind, item.text), width - prefixWidth - rightBuffer);
+	const lines = clampLines(wrapBlock(cleanTextForKind(item.kind, item.text), width - prefixWidth - rightBuffer), maxRenderedLines);
 	const marginBottom = marginBottomForKind(item.kind);
 	const bold = item.kind === 'tool';
 
@@ -43,19 +44,27 @@ function TranscriptBlock({item, width}: {item: TranscriptItem; width: number}) {
 	);
 }
 
-function MarkdownBlock({item, width}: {item: TranscriptItem; width: number}) {
+function MarkdownBlock({item, width, maxRenderedLines}: {item: TranscriptItem; width: number; maxRenderedLines?: number}) {
 	const rightBuffer = 8;
 	const rendered = renderMarkdownLines(item.text);
+	const lines = rendered.flatMap((line, lineIndex) =>
+		wrapBlock(line.text, width - gutterWidth(item.kind) - rightBuffer).map((wrapped, wrappedIndex) => ({
+			key: `${item.id}-${lineIndex}-${wrappedIndex}`,
+			text: wrapped,
+			color: line.color,
+			bold: line.bold,
+			gutterIndex: lineIndex === 0 && wrappedIndex === 0 ? 0 : 1
+		}))
+	);
+	const visibleLines = clampLines(lines, maxRenderedLines);
 	return (
 		<Box flexDirection="column" marginBottom={1}>
-			{rendered.flatMap((line, lineIndex) =>
-				wrapBlock(line.text, width - gutterWidth(item.kind) - rightBuffer).map((wrapped, wrappedIndex) => (
-					<Text key={`${item.id}-${lineIndex}-${wrappedIndex}`} color={line.color ?? colorForKind(item.kind)} bold={line.bold} dimColor={isSoftKind(item.kind)}>
-						{gutterForKind(item.kind, lineIndex === 0 && wrappedIndex === 0 ? 0 : 1)}
-						{wrapped}
-					</Text>
-				))
-			)}
+			{visibleLines.map(line => (
+				<Text key={line.key} color={line.color ?? colorForKind(item.kind)} bold={line.bold} dimColor={isSoftKind(item.kind)}>
+					{gutterForKind(item.kind, line.gutterIndex)}
+					{line.text}
+				</Text>
+			))}
 		</Box>
 	);
 }
@@ -143,4 +152,11 @@ function cleanTextForKind(kind: TranscriptItem['kind'], text: string) {
 		return text.replace(/^\s*(?:└|L)\s*/, '');
 	}
 	return text;
+}
+
+function clampLines<T>(lines: T[], limit?: number) {
+	if (!limit || lines.length <= limit) {
+		return lines;
+	}
+	return lines.slice(-limit);
 }

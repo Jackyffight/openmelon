@@ -1,6 +1,6 @@
 import ansiRegex from 'ansi-regex';
 import stringWidth from 'string-width';
-import {cursorAnchorMarker} from './cursorAnchor.js';
+import {cursorAnchorPattern} from './cursorAnchor.js';
 
 const esc = '\u001B[';
 const cursorLeft = `${esc}G`;
@@ -56,17 +56,26 @@ export function createAnchoredStdout(stdout: NodeJS.WriteStream): NodeJS.WriteSt
 }
 
 function extractCursorAnchor(text: string) {
-	const markerIndex = text.indexOf(cursorAnchorMarker);
-	if (markerIndex < 0) {
+	const match = cursorAnchorPattern.exec(text);
+	if (!match || match.index === undefined) {
 		return {text};
 	}
 
-	const before = text.slice(0, markerIndex);
-	const after = text.slice(markerIndex + cursorAnchorMarker.length);
+	const before = text.slice(0, match.index);
+	const after = text.slice(match.index + match[0].length);
+	if (match[1] !== undefined && match[2] !== undefined) {
+		return {
+			text: `${before}${after}`,
+			anchor: {
+				column: Number(match[1]),
+				rowFromBottom: Number(match[2])
+			}
+		};
+	}
 	const lines = before.split('\n');
 	const row = lines.length - 1;
 	const column = stringWidth(stripAnsi(lines.at(-1) ?? ''));
-	const totalRows = before.split('\n').length + after.split('\n').length - 1;
+	const totalRows = `${before}${after}`.split('\n').length - 1;
 	const rowFromBottom = Math.max(0, totalRows - row - 1);
 
 	return {

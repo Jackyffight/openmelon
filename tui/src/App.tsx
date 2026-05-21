@@ -1,5 +1,5 @@
 import React, {useCallback, useEffect, useMemo, useReducer, useRef, useState} from 'react';
-import {Box, useApp, useInput, useStdout} from 'ink';
+import {Box, Static, useApp, useInput, useStdout} from 'ink';
 import {filterSlashCommands, slashCommands} from './commands.js';
 import {HeaderCard} from './components/Header.js';
 import {PromptInput} from './components/PromptInput.js';
@@ -45,16 +45,22 @@ type OverlayRow = SelectorRow & {
 	section?: boolean;
 };
 
+type StaticRecord =
+	| {key: 'header'; kind: 'header'; state: TuiState}
+	| {key: string; kind: 'item'; item: TranscriptItem};
+
 export function App({resumeId, initialPrompt, onSessionInfo}: Props) {
 	const {exit} = useApp();
 	const {stdout} = useStdout();
 	const width = Math.max(32, stdout.columns ?? 88);
+	const height = Math.max(16, stdout.rows ?? 32);
 	const [state, dispatch] = useReducer(reducer, undefined, initialState);
 	const placeholder = useMemo(() => randomPlaceholder(), []);
 	const [running, setRunning] = useState(false);
 	const [, setClock] = useState(0);
 	const [bootstrap, setBootstrap] = useState<BootstrapState | null>(null);
 	const [overlay, setOverlay] = useState<Overlay | null>(null);
+	const [staticEpoch, setStaticEpoch] = useState(0);
 	const runtimeBridge = useRef<RuntimeClient | null>(null);
 	const stateRef = useRef(state);
 	const submittedRef = useRef(false);
@@ -263,6 +269,7 @@ export function App({resumeId, initialPrompt, onSessionInfo}: Props) {
 		}
 		if (text === '/clear') {
 			submittedRef.current = false;
+			setStaticEpoch(value => value + 1);
 			dispatch({type: 'clear-transcript'});
 			runtimeCommand(runtimeBridge.current, dispatch, bridge => bridge.clearHistory());
 			return;
@@ -645,10 +652,32 @@ export function App({resumeId, initialPrompt, onSessionInfo}: Props) {
 		return <Onboarding bootstrap={bootstrap} onComplete={refreshBootstrap} />;
 	}
 
+	const streaming = running || state.status === 'thinking' || state.status === 'tool';
+	const lastItem = state.items.at(-1);
+	const liveItems = streaming && lastItem?.kind === 'assistant' ? [lastItem] : [];
+	const stableItems = liveItems.length > 0 ? state.items.slice(0, -1) : state.items;
+	const staticRecords: StaticRecord[] = [
+		{key: 'header', kind: 'header', state},
+		...stableItems.map(item => ({key: `item-${item.id}`, kind: 'item' as const, item}))
+	];
+	const liveLineBudget = Math.max(6, Math.min(16, Math.floor(height * 0.4)));
+
 	return (
 		<Box flexDirection="column">
-			<HeaderCard state={state} />
-			<Transcript items={state.items} width={width} />
+			<Static key={staticEpoch} items={staticRecords}>
+				{record =>
+					record.kind === 'header' ? (
+						<Box key={record.key}>
+							<HeaderCard state={record.state} />
+						</Box>
+					) : (
+						<Box key={record.key}>
+							<Transcript items={[record.item]} width={width} />
+						</Box>
+					)
+				}
+			</Static>
+			{liveItems.length > 0 && <Transcript items={liveItems} width={width} maxRenderedLines={liveLineBudget} />}
 			<WorkingLine state={state} />
 			<Box flexDirection="column">
 				{overlay ? (
