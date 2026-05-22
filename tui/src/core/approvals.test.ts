@@ -19,3 +19,23 @@ test('project approvals persist and match by tool and binary', async () => {
 	const store = JSON.parse(await readFile(path.join(workdir, '.openmelon', 'approvals.json'), 'utf8')) as {rules: unknown[]};
 	assert.equal(store.rules.length, 1);
 });
+
+test('project approvals distinguish web search provider and fetch host', async () => {
+	const workdir = await mkdtemp(path.join(tmpdir(), 'openmelon-web-approvals-'));
+	await recordProjectApproval(workdir, {
+		tool: 'web_search',
+		binary: 'duckduckgo.com',
+		command: 'openmelon',
+		description: 'search'
+	});
+	await recordProjectApproval(workdir, {
+		tool: 'web_fetch',
+		binary: 'example.com',
+		command: 'https://example.com/article',
+		description: 'fetch'
+	});
+
+	assert.equal((await findProjectApproval(workdir, {tool: 'web_search', binary: 'duckduckgo.com', command: 'x', description: 'search'}))?.tool, 'web_search');
+	assert.equal((await findProjectApproval(workdir, {tool: 'web_fetch', binary: 'example.com', command: 'https://example.com/other', description: 'fetch'}))?.tool, 'web_fetch');
+	assert.equal(await findProjectApproval(workdir, {tool: 'web_fetch', binary: 'other.test', command: 'https://other.test', description: 'fetch'}), null);
+});

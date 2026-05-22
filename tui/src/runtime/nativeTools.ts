@@ -19,6 +19,7 @@ import {
 } from '../core/space.js';
 import {generateOpenAIImage, generateOpenRouterImage} from './openaiCompat.js';
 import type {NativeRuntimeContext, NativeTool} from './nativeTypes.js';
+import {webFetchTool, webSearchTool} from './webTools.js';
 
 export function buildNativeTools(ctx: NativeRuntimeContext): NativeTool[] {
 	const tools = [
@@ -27,6 +28,8 @@ export function buildNativeTools(ctx: NativeRuntimeContext): NativeTool[] {
 		listRegistryTool(ctx, 'reference'),
 		getRegistryTool(ctx, 'reference'),
 		searchTool(ctx),
+		webSearchTool(ctx),
+		webFetchTool(ctx),
 		readFileTool(ctx),
 		listSpacesTool(ctx),
 		planWorkflowTool(ctx),

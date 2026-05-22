@@ -11,6 +11,7 @@ export type RuntimeStatus = 'ready' | 'thinking' | 'tool' | 'error';
 
 export type TuiState = {
 	items: TranscriptItem[];
+	commandPanel: TranscriptItem | null;
 	input: string;
 	inputCursor: number;
 	inputPreferredColumn: number | null;
@@ -41,6 +42,8 @@ export type TuiState = {
 export type TuiAction =
 	| {type: 'append'; kind: TranscriptKind; text: string}
 	| {type: 'append-delta'; kind: TranscriptKind; text: string; markdown?: boolean}
+	| {type: 'command-panel'; kind: TranscriptKind; text: string; markdown?: boolean}
+	| {type: 'clear-command-panel'}
 	| {type: 'set-input'; input: string}
 	| {type: 'insert'; text: string}
 	| {type: 'backspace'}
@@ -63,6 +66,6 @@ export type TuiAction =
 	| {type: 'arm-quit'; at: number}
 	| {type: 'set-usage'; promptTokens: number; completionTokens: number}
 	| {type: 'turn-started'; at: number}
-	| {type: 'runtime-ready'; model?: string; reasoning?: string; project?: string; provider?: string; sessionId?: string; sessionDir?: string}
+	| {type: 'runtime-ready'; model?: string; reasoning?: string; project?: string; provider?: string; sessionId?: string; sessionDir?: string; clearSession?: boolean}
 	| {type: 'set-active-skill'; skill: string}
 	| {type: 'clear-transcript'};

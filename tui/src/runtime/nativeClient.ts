@@ -25,7 +25,7 @@ export function createNativeRuntimeClient(emit: RuntimeEventHandler, options: Ru
 	let systemPrompt = '';
 	const pending: string[] = [];
 	const approvals = new Map<string, (decision: {approved: boolean; always: boolean}) => void>();
-	const alwaysApprovedBinaries = new Set<string>();
+	const alwaysApprovedScopes = new Set<string>();
 	let approvalSeq = 0;
 
 	const ready = (async () => {
@@ -227,13 +227,16 @@ export function createNativeRuntimeClient(emit: RuntimeEventHandler, options: Ru
 	}
 
 	function approvalRequest(req: {id: string; tool: string; command: string; description: string; binary: string}) {
-		if (req.tool === 'bash' && req.binary && alwaysApprovedBinaries.has(req.binary)) {
+		const key = approvalKey(req);
+		if (key && alwaysApprovedScopes.has(key)) {
 			return Promise.resolve({approved: true, always: true});
 		}
 		if (context) {
 			return findProjectApproval(context.workdir, req).then(rule => {
 				if (rule) {
-					alwaysApprovedBinaries.add(req.binary);
+					if (key) {
+						alwaysApprovedScopes.add(key);
+					}
 					return {approved: true, always: true};
 				}
 				return promptApproval(req);
@@ -246,8 +249,9 @@ export function createNativeRuntimeClient(emit: RuntimeEventHandler, options: Ru
 		const id = `approval-${++approvalSeq}`;
 		return new Promise<{approved: boolean; always: boolean}>(resolve => {
 			approvals.set(id, decision => {
-				if (decision.approved && decision.always && req.tool === 'bash' && req.binary) {
-					alwaysApprovedBinaries.add(req.binary);
+				const key = approvalKey(req);
+				if (decision.approved && decision.always && key) {
+					alwaysApprovedScopes.add(key);
 					if (context) {
 						void recordProjectApproval(context.workdir, req);
 					}
@@ -256,6 +260,10 @@ export function createNativeRuntimeClient(emit: RuntimeEventHandler, options: Ru
 			});
 			emit({type: 'approval', activity: `Approve ${req.tool}`, detail: {...req, id}});
 		});
+	}
+
+	function approvalKey(req: {tool: string; binary: string}) {
+		return req.tool && req.binary ? `${req.tool}:${req.binary}` : '';
 	}
 
 	async function persistMessages(messages: ChatMessage[]) {
@@ -294,25 +302,41 @@ export function createNativeRuntimeClient(emit: RuntimeEventHandler, options: Ru
 		clearHistory() {
 			history = [];
 			persisted = 0;
-			emit({type: 'append', kind: 'info', text: '(history cleared)'});
+			session = null;
+			context = null;
+			rebuildToolsAndPrompt();
+			emit({
+				type: 'ready',
+				status: 'ready',
+				activity: 'Ready',
+				sessionId: '',
+				sessionDir: '',
+				clearSession: true,
+				model: boot?.llm.model,
+				reasoning: boot?.llm.reasoning,
+				project: boot?.project.id,
+				provider: boot?.llm.provider
+			});
+			emit({type: 'append', kind: 'info', text: '(conversation cleared; next message starts a new session)', transient: true});
 		},
 		history() {
 			if (history.length === 0) {
-				emit({type: 'append', kind: 'info', text: '(no conversation history)'});
+				emit({type: 'append', kind: 'info', text: '(no conversation history)', transient: true});
 				return;
 			}
 			emit({
 				type: 'append',
 				kind: 'info',
-				text: history.map((message, index) => `  [${index}] ${message.role}: ${truncate((message.content ?? '').replace(/\s+/g, ' '), 200)}`).join('\n')
+				text: history.map((message, index) => `  [${index}] ${message.role}: ${truncate((message.content ?? '').replace(/\s+/g, ' '), 200)}`).join('\n'),
+				transient: true
 			});
 		},
 		save(filePath: string) {
 			void (async () => {
 				const {promises: fs} = await import('node:fs');
 				await fs.writeFile(filePath, history.map(message => JSON.stringify(message)).join('\n') + '\n');
-				emit({type: 'append', kind: 'info', text: `saved ${history.length} messages -> ${filePath}`});
-			})().catch(error => emit({type: 'append', kind: 'error', text: `/save: ${(error as Error).message}`}));
+				emit({type: 'append', kind: 'info', text: `saved ${history.length} messages -> ${filePath}`, transient: true});
+			})().catch(error => emit({type: 'append', kind: 'error', text: `/save: ${(error as Error).message}`, transient: true}));
 		},
 		reload() {
 			void reloadRuntime();
@@ -449,6 +473,19 @@ function compactToolResult(value: unknown) {
 	}
 	if (value && typeof value === 'object') {
 		const obj = value as Record<string, unknown>;
+		if (Array.isArray(obj.results)) {
+			const lines = obj.results.slice(0, 3).map((item, index) => {
+				const hit = item as Record<string, unknown>;
+				const title = truncate(String(hit.title ?? hit.url ?? `result ${index + 1}`), 80);
+				const url = truncate(String(hit.url ?? ''), 120);
+				return `${index + 1}. ${title}${url ? ` - ${url}` : ''}`;
+			});
+			return truncate(lines.length > 0 ? lines.join('\n') : 'no results', 360);
+		}
+		if (typeof obj.url === 'string' && typeof obj.content === 'string') {
+			const title = obj.title ? `${String(obj.title)} - ` : '';
+			return truncate(`${title}${obj.url}\n${obj.content}`, 360);
+		}
 		for (const key of ['path', 'file', 'output', 'summary', 'status']) {
 			if (obj[key] !== undefined) {
 				return truncate(`${key}: ${String(obj[key])}`, 220);

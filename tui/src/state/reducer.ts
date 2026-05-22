@@ -13,6 +13,7 @@ import {
 export function initialState(): TuiState {
 	return {
 		items: [],
+		commandPanel: null,
 		input: '',
 		inputCursor: 0,
 		inputPreferredColumn: null,
@@ -46,6 +47,7 @@ export function reducer(state: TuiState, action: TuiAction): TuiState {
 		case 'append':
 			return {
 				...state,
+				commandPanel: null,
 				items: [...state.items, {id: state.nextId, kind: action.kind, text: action.text, markdown: action.kind === 'assistant'}],
 				nextId: state.nextId + 1
 			};
@@ -54,6 +56,7 @@ export function reducer(state: TuiState, action: TuiAction): TuiState {
 			if (last && last.kind === action.kind && Boolean(last.markdown) === Boolean(action.markdown)) {
 				return {
 					...state,
+					commandPanel: null,
 					items: [
 						...state.items.slice(0, -1),
 						{
@@ -65,6 +68,7 @@ export function reducer(state: TuiState, action: TuiAction): TuiState {
 			}
 			return {
 				...state,
+				commandPanel: null,
 				items: [
 					...state.items,
 					{id: state.nextId, kind: action.kind, text: action.text, markdown: action.markdown ?? action.kind === 'assistant'}
@@ -72,10 +76,17 @@ export function reducer(state: TuiState, action: TuiAction): TuiState {
 				nextId: state.nextId + 1
 			};
 		}
+		case 'command-panel':
+			return {
+				...state,
+				commandPanel: {id: 0, kind: action.kind, text: action.text, markdown: action.markdown ?? action.kind === 'assistant'}
+			};
+		case 'clear-command-panel':
+			return {...state, commandPanel: null};
 		case 'set-input':
-			return updateInput(state, editorWithText(action.input), {historyIndex: null, notice: ''});
+			return updateInput(state, editorWithText(action.input), {historyIndex: null, notice: '', commandPanel: null});
 		case 'insert':
-			return updateInput(state, insertText(currentEditor(state), action.text), {historyIndex: null, notice: ''});
+			return updateInput(state, insertText(currentEditor(state), action.text), {historyIndex: null, notice: '', commandPanel: null});
 		case 'backspace':
 			return updateInput(state, backspace(currentEditor(state)), {historyIndex: null});
 		case 'delete-forward':
@@ -109,6 +120,7 @@ export function reducer(state: TuiState, action: TuiAction): TuiState {
 				historyIndex: null,
 				historyDraft: '',
 				paletteIndex: 0,
+				commandPanel: null,
 				notice: action.notice ?? ''
 			};
 		}
@@ -120,6 +132,7 @@ export function reducer(state: TuiState, action: TuiAction): TuiState {
 					: state.inputHistory;
 			return {
 				...state,
+				commandPanel: null,
 				items: [...state.items, {id: state.nextId, kind: 'user', text: action.text}],
 				input: '',
 				inputCursor: 0,
@@ -177,6 +190,7 @@ export function reducer(state: TuiState, action: TuiAction): TuiState {
 		case 'queue-pending':
 			return {
 				...state,
+				commandPanel: null,
 				pendingInputs: [...state.pendingInputs, action.text],
 				notice: `${state.pendingInputs.length + 1} pending input`
 			};
@@ -196,6 +210,7 @@ export function reducer(state: TuiState, action: TuiAction): TuiState {
 			return {
 				...state,
 				...inputPatch(editorWithText(text)),
+				commandPanel: null,
 				pendingInputs: [],
 				notice: 'pending input recalled'
 			};
@@ -230,13 +245,13 @@ export function reducer(state: TuiState, action: TuiAction): TuiState {
 				reasoning: action.reasoning || state.reasoning,
 				project: action.project || state.project,
 				provider: action.provider || state.provider,
-				sessionId: action.sessionId || state.sessionId,
-				sessionDir: action.sessionDir || state.sessionDir
+				sessionId: action.clearSession ? '' : action.sessionId || state.sessionId,
+				sessionDir: action.clearSession ? '' : action.sessionDir || state.sessionDir
 			};
 		case 'set-active-skill':
-			return {...state, activeSkill: action.skill, notice: action.skill ? `skill ${action.skill} applies to next message` : 'skill cleared'};
+			return {...state, activeSkill: action.skill, commandPanel: null, notice: action.skill ? `skill ${action.skill} applies to next message` : 'skill cleared'};
 		case 'clear-transcript':
-			return {...state, items: [], nextId: 1};
+			return {...state, items: [], commandPanel: null, nextId: 1};
 	}
 }
 

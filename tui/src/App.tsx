@@ -113,12 +113,15 @@ export function App({resumeId, initialPrompt, onSessionInfo}: Props) {
 					project: event.project,
 					provider: event.provider,
 					sessionId: event.sessionId,
-					sessionDir: event.sessionDir
+					sessionDir: event.sessionDir,
+					clearSession: event.clearSession
 				});
 				dispatch({type: 'status', status: 'ready', activity: event.activity ?? 'Ready'});
 				break;
 			case 'append':
-				if (event.kind === 'error' && stateRef.current.items.length === 0 && !submittedRef.current) {
+				if (event.transient) {
+					dispatch({type: 'command-panel', kind: event.kind, text: event.text, markdown: event.markdown});
+				} else if (event.kind === 'error' && stateRef.current.items.length === 0 && !submittedRef.current) {
 					dispatch({type: 'notice', notice: event.text});
 				} else if (event.delta) {
 					dispatch({type: 'append-delta', kind: event.kind, text: event.text, markdown: event.markdown ?? event.kind === 'assistant'});
@@ -254,7 +257,7 @@ export function App({resumeId, initialPrompt, onSessionInfo}: Props) {
 		}
 		if (text === '/help' || text === '/?') {
 			dispatch({
-				type: 'append',
+				type: 'command-panel',
 				kind: 'info',
 				text: 'Commands:\n' + slashCommands.map(command => `  ${command.name.padEnd(14)} ${command.help}`).join('\n')
 			});
@@ -263,23 +266,24 @@ export function App({resumeId, initialPrompt, onSessionInfo}: Props) {
 		if (text === '/copy') {
 			const body = transcriptText(stateRef.current.items);
 			if (!body.trim()) {
-				dispatch({type: 'append', kind: 'error', text: 'nothing to copy'});
+				dispatch({type: 'command-panel', kind: 'error', text: 'nothing to copy'});
 				return;
 			}
 			osc52Copy(body);
-			dispatch({type: 'append', kind: 'info', text: `copied transcript (${Array.from(body).length} chars)`});
+			dispatch({type: 'command-panel', kind: 'info', text: `copied transcript (${Array.from(body).length} chars)`});
 			return;
 		}
 		if (text === '/clear') {
 			submittedRef.current = false;
 			setStaticEpoch(value => value + 1);
 			dispatch({type: 'clear-transcript'});
+			clearTerminalScreen();
 			runtimeCommand(runtimeBridge.current, dispatch, bridge => bridge.clearHistory());
 			return;
 		}
 		if (text === '/status') {
 			dispatch({
-				type: 'append',
+				type: 'command-panel',
 				kind: 'info',
 				text: `project ${stateRef.current.project} · provider ${stateRef.current.provider || 'default'} · model ${stateRef.current.model} · reasoning ${stateRef.current.reasoning} · session ${stateRef.current.sessionId || '(starting)'}`
 			});
@@ -293,10 +297,10 @@ export function App({resumeId, initialPrompt, onSessionInfo}: Props) {
 			const arg = text.split(/\s+/, 2)[1] ?? '';
 			if (['clear', 'off', 'none'].includes(arg)) {
 				dispatch({type: 'set-active-skill', skill: ''});
-				dispatch({type: 'append', kind: 'info', text: '(skill cleared)'});
+				dispatch({type: 'command-panel', kind: 'info', text: '(skill cleared)'});
 			} else {
 				dispatch({type: 'set-active-skill', skill: arg});
-				dispatch({type: 'append', kind: 'info', text: `(skill: ${arg}) — applies to your next message`});
+				dispatch({type: 'command-panel', kind: 'info', text: `(skill: ${arg}) — applies to your next message`});
 			}
 			return;
 		}
@@ -307,7 +311,7 @@ export function App({resumeId, initialPrompt, onSessionInfo}: Props) {
 		if (text.startsWith('/save')) {
 			const [, rawPath] = text.split(/\s+/, 2);
 			if (!rawPath) {
-				dispatch({type: 'append', kind: 'error', text: '/save: usage: /save <path>'});
+				dispatch({type: 'command-panel', kind: 'error', text: '/save: usage: /save <path>'});
 				return;
 			}
 			runtimeCommand(runtimeBridge.current, dispatch, bridge => bridge.save(rawPath));
@@ -316,7 +320,7 @@ export function App({resumeId, initialPrompt, onSessionInfo}: Props) {
 		if (text === '/session') {
 			const current = stateRef.current;
 			const dir = current.sessionDir || (bootstrap?.workdir && current.sessionId ? sessionDir(bootstrap.workdir, current.sessionId) : '');
-			dispatch({type: 'append', kind: 'info', text: dir || '(session not ready)'});
+			dispatch({type: 'command-panel', kind: 'info', text: dir || '(session not ready)'});
 			return;
 		}
 		if (text === '/events') {
@@ -337,7 +341,7 @@ export function App({resumeId, initialPrompt, onSessionInfo}: Props) {
 		}
 		if (text.startsWith('/model ')) {
 			if (!bootstrap) {
-				dispatch({type: 'append', kind: 'error', text: 'bootstrap is not ready'});
+				dispatch({type: 'command-panel', kind: 'error', text: 'bootstrap is not ready'});
 				return;
 			}
 			void applyModelCommand(text, bootstrap, dispatch, reloadRuntime, refreshBootstrap);
@@ -349,7 +353,7 @@ export function App({resumeId, initialPrompt, onSessionInfo}: Props) {
 		}
 		if (text.startsWith('/model-image ')) {
 			if (!bootstrap) {
-				dispatch({type: 'append', kind: 'error', text: 'bootstrap is not ready'});
+				dispatch({type: 'command-panel', kind: 'error', text: 'bootstrap is not ready'});
 				return;
 			}
 			void applyImageModelCommand(text, bootstrap, dispatch, reloadRuntime, refreshBootstrap);
@@ -361,14 +365,14 @@ export function App({resumeId, initialPrompt, onSessionInfo}: Props) {
 		}
 		if (text.startsWith('/settings ') || text.startsWith('/config ')) {
 			if (!bootstrap) {
-				dispatch({type: 'append', kind: 'error', text: 'bootstrap is not ready'});
+				dispatch({type: 'command-panel', kind: 'error', text: 'bootstrap is not ready'});
 				return;
 			}
 			void applySettingsCommand(text, bootstrap, dispatch, reloadRuntime, refreshBootstrap);
 			return;
 		}
 		if (text.startsWith('/')) {
-			dispatch({type: 'append', kind: 'error', text: `unknown command: ${text.split(/\s+/)[0]} (try /help)`});
+			dispatch({type: 'command-panel', kind: 'error', text: `unknown command: ${text.split(/\s+/)[0]} (try /help)`});
 			return;
 		}
 
@@ -718,11 +722,12 @@ export function App({resumeId, initialPrompt, onSessionInfo}: Props) {
 			</Static>
 			{liveItems.length > 0 && <Transcript items={liveItems} width={width} maxRenderedLines={liveLineBudget} />}
 			<WorkingLine state={state} />
+			{state.commandPanel && <Transcript items={[state.commandPanel]} width={width} maxRenderedLines={Math.max(6, Math.min(18, height - 10))} />}
 			<Box flexDirection="column">
 				{overlay ? (
 					<SelectorPanel {...overlayView(overlay, bootstrap, state)} />
 				) : filteredCommands.length > 0 ? (
-					<SlashPalette commands={filteredCommands} active={state.paletteIndex} />
+					<SlashPalette commands={filteredCommands} active={state.paletteIndex} visibleRows={Math.max(4, Math.min(8, height - 8))} />
 				) : null}
 				{!overlay && <PromptInput input={state.input} cursor={state.inputCursor} placeholder={placeholder} width={width} />}
 				<StatusLine state={state} width={width} />
@@ -733,6 +738,12 @@ export function App({resumeId, initialPrompt, onSessionInfo}: Props) {
 
 function matchesExit(text: string) {
 	return text === '/exit' || text === '/quit' || text === '/q';
+}
+
+function clearTerminalScreen() {
+	if (process.stdout.isTTY) {
+		process.stdout.write('\u001Bc');
+	}
 }
 
 function isShiftEnter(chunk: string, key: {return?: boolean; shift?: boolean}) {
@@ -861,7 +872,7 @@ function transcriptText(items: TranscriptItem[]) {
 
 function runtimeCommand(bridge: RuntimeClient | null, dispatch: Dispatch, run: (bridge: RuntimeClient) => void) {
 	if (!bridge || !bridge.isAvailable()) {
-		dispatch({type: 'append', kind: 'error', text: 'runtime unavailable'});
+		dispatch({type: 'command-panel', kind: 'error', text: 'runtime unavailable'});
 		return;
 	}
 	run(bridge);
@@ -869,16 +880,16 @@ function runtimeCommand(bridge: RuntimeClient | null, dispatch: Dispatch, run: (
 
 async function eventsCommand(workdir: string, sessionId: string, dispatch: Dispatch) {
 	if (!workdir || !sessionId) {
-		dispatch({type: 'append', kind: 'error', text: '/events: session is not ready'});
+		dispatch({type: 'command-panel', kind: 'error', text: '/events: session is not ready'});
 		return;
 	}
 	const events = await loadSessionEvents(workdir, sessionId, 20);
 	if (events.length === 0) {
-		dispatch({type: 'append', kind: 'info', text: '(no events recorded yet)'});
+		dispatch({type: 'command-panel', kind: 'info', text: '(no events recorded yet)'});
 		return;
 	}
 	dispatch({
-		type: 'append',
+		type: 'command-panel',
 		kind: 'info',
 		text: events
 			.map(event => `${event.type ?? 'event'} step=${event.step ?? 0} tool=${event.tool ?? ''} space=${event.space_id ?? ''} status=${event.status ?? ''}`)
@@ -889,12 +900,12 @@ async function eventsCommand(workdir: string, sessionId: string, dispatch: Dispa
 async function spaceCommand(text: string, workdir: string, dispatch: Dispatch) {
 	const [, id] = text.split(/\s+/, 2);
 	if (!workdir || !id) {
-		dispatch({type: 'append', kind: 'error', text: '/space: usage: /space <id>'});
+		dispatch({type: 'command-panel', kind: 'error', text: '/space: usage: /space <id>'});
 		return;
 	}
 	const summary = await summarizeSpace(workdir, id);
 	dispatch({
-		type: 'append',
+		type: 'command-panel',
 		kind: 'info',
 		text: `${summary.meta.id} (${summary.meta.status ?? 'unknown'}): ${summary.meta.name ?? ''}\n  ${summary.decisions} decisions · ${summary.feedback} feedback · ${summary.episodes} episodes · ${summary.assets} assets`
 	});
@@ -903,11 +914,11 @@ async function spaceCommand(text: string, workdir: string, dispatch: Dispatch) {
 async function compactCommand(text: string, workdir: string, dispatch: Dispatch) {
 	const [, id] = text.split(/\s+/, 2);
 	if (!workdir || !id) {
-		dispatch({type: 'append', kind: 'error', text: '/compact: usage: /compact <space-id>'});
+		dispatch({type: 'command-panel', kind: 'error', text: '/compact: usage: /compact <space-id>'});
 		return;
 	}
 	const draft = await buildCompactionDraft(workdir, id);
-	dispatch({type: 'append', kind: 'assistant', text: draft || '(empty compaction draft)'});
+	dispatch({type: 'command-panel', kind: 'assistant', text: draft || '(empty compaction draft)', markdown: true});
 }
 
 async function applyModelCommand(
@@ -920,7 +931,7 @@ async function applyModelCommand(
 	const parts = text.split(/\s+/);
 	const model = parts[1]?.trim();
 	if (!model) {
-		dispatch({type: 'append', kind: 'error', text: '/model: usage: /model <model-id>'});
+		dispatch({type: 'command-panel', kind: 'error', text: '/model: usage: /model <model-id>'});
 		return;
 	}
 	await applyModelDefaults(bootstrap, dispatch, reloadRuntime, refreshBootstrap, {
@@ -940,7 +951,7 @@ async function applyImageModelCommand(
 	const first = parts[1]?.trim();
 	if (!first) {
 		dispatch({
-			type: 'append',
+			type: 'command-panel',
 			kind: 'error',
 			text: '/model-image: usage: /model-image <model-id> | /model-image <provider> <model-id> | /model-image off'
 		});
@@ -975,39 +986,39 @@ async function applySettingsCommand(
 	const value = parts[2];
 	if (!section || !value) {
 		dispatch({
-			type: 'append',
+			type: 'command-panel',
 			kind: 'error',
 			text: '/settings: usage: /settings bash strict|auto|trusted or /settings reasoning auto|medium|high|xhigh'
 		});
 		return;
 	}
 	if (!bootstrap.workdir) {
-		dispatch({type: 'append', kind: 'error', text: 'project is not ready'});
+		dispatch({type: 'command-panel', kind: 'error', text: 'project is not ready'});
 		return;
 	}
 	const project = await loadProject(bootstrap.workdir);
 	project.settings = project.settings ?? {};
 	if (section === 'bash') {
 		if (!['strict', 'auto', 'trusted'].includes(value)) {
-			dispatch({type: 'append', kind: 'error', text: '/settings bash: expected strict|auto|trusted'});
+			dispatch({type: 'command-panel', kind: 'error', text: '/settings bash: expected strict|auto|trusted'});
 			return;
 		}
 		project.settings.bash_permission_mode = value as 'strict' | 'auto' | 'trusted';
 	} else if (section === 'reasoning') {
 		if (!['auto', 'medium', 'high', 'xhigh'].includes(value)) {
-			dispatch({type: 'append', kind: 'error', text: '/settings reasoning: expected auto|medium|high|xhigh'});
+			dispatch({type: 'command-panel', kind: 'error', text: '/settings reasoning: expected auto|medium|high|xhigh'});
 			return;
 		}
 		project.settings.reasoning_effort = value === 'auto' ? undefined : (value as ProjectSettings['reasoning_effort']);
 	} else {
-		dispatch({type: 'append', kind: 'error', text: '/settings: expected bash or reasoning'});
+		dispatch({type: 'command-panel', kind: 'error', text: '/settings: expected bash or reasoning'});
 		return;
 	}
 	await saveProject(bootstrap.workdir, project);
 	await refreshBootstrap();
 	reloadRuntime();
 	dispatch({
-		type: 'append',
+		type: 'command-panel',
 		kind: 'info',
 		text: `(settings: bash=${project.settings.bash_permission_mode || 'strict'} reasoning=${project.settings.reasoning_effort || 'auto'})`
 	});
@@ -1035,7 +1046,7 @@ function overlayView(overlay: Overlay, bootstrap: BootstrapState, state: TuiStat
 				? `Details ${start + 1}-${end}/${lines.length} · PgUp/PgDn scroll\n\n${lines.slice(start, end).join('\n')}`
 				: detail;
 		return {
-			title: `Bash approval required: ${overlay.tool}`,
+			title: `${approvalToolLabel(overlay.tool)} approval required`,
 			description,
 			rows: approvalRows(overlay),
 			active: overlay.cursor,
@@ -1129,7 +1140,7 @@ async function openSkillOverlay(setOverlay: React.Dispatch<React.SetStateAction<
 		setOverlay({kind: 'skill', cursor: 0, skills, error: skills.length === 0 ? 'No skillplus packages found.' : ''});
 	} catch (error) {
 		setOverlay({kind: 'skill', cursor: 0, skills: [], error: `error listing skills: ${(error as Error).message}`});
-		dispatch({type: 'append', kind: 'error', text: `/skill: ${(error as Error).message}`});
+		dispatch({type: 'command-panel', kind: 'error', text: `/skill: ${(error as Error).message}`});
 	}
 }
 
@@ -1154,16 +1165,17 @@ function skillRows(overlay: Extract<Overlay, {kind: 'skill'}>, state: TuiState):
 function commitSkillRow(row: OverlayRow, dispatch: Dispatch) {
 	dispatch({type: 'set-active-skill', skill: row.value});
 	dispatch({
-		type: 'append',
+		type: 'command-panel',
 		kind: 'info',
 		text: row.value ? `(skill: ${row.value}) — applies to your next message` : '(skill cleared)'
 	});
 }
 
 function approvalRows(overlay: Extract<Overlay, {kind: 'approval'}>): OverlayRow[] {
+	const scope = approvalScopeLabel(overlay);
 	return [
 		{id: 'yes', value: 'yes', title: 'Yes'},
-		{id: 'always', value: 'always', title: `Yes, always allow \`${overlay.binary || 'this binary'}\` in this project`},
+		{id: 'always', value: 'always', title: `Yes, always allow ${scope} in this project`},
 		{id: 'no', value: 'no', title: 'No'}
 	];
 }
@@ -1174,9 +1186,29 @@ function approvalDetailText(overlay: Extract<Overlay, {kind: 'approval'}>) {
 		parts.push(`Reason\n${overlay.description.trim()}`);
 	}
 	if (overlay.command.trim()) {
-		parts.push(`Command\n${overlay.command.trim()}`);
+		parts.push(`${overlay.tool === 'bash' ? 'Command' : 'Target'}\n${overlay.command.trim()}`);
 	}
-	return parts.join('\n\n') || 'Review the command before approving.';
+	return parts.join('\n\n') || 'Review the request before approving.';
+}
+
+function approvalToolLabel(tool: string) {
+	if (tool === 'web_search') {
+		return 'Web search';
+	}
+	if (tool === 'web_fetch') {
+		return 'Web fetch';
+	}
+	return tool === 'bash' ? 'Bash' : tool;
+}
+
+function approvalScopeLabel(overlay: Extract<Overlay, {kind: 'approval'}>) {
+	if (overlay.tool === 'web_search') {
+		return 'web searches through DuckDuckGo';
+	}
+	if (overlay.tool === 'web_fetch') {
+		return `fetching ${overlay.binary || 'this host'}`;
+	}
+	return `\`${overlay.binary || 'this binary'}\``;
 }
 
 function approvalBodyRows() {
@@ -1213,11 +1245,11 @@ async function applyOverlaySelection(
 		return;
 	}
 	if (!bootstrap.workdir) {
-		dispatch({type: 'append', kind: 'error', text: 'project is not ready'});
+		dispatch({type: 'command-panel', kind: 'error', text: 'project is not ready'});
 		return;
 	}
 	if (row.value === 'custom') {
-		dispatch({type: 'append', kind: 'info', text: 'custom model input is not wired yet; edit project defaults or run setup with flags.'});
+		dispatch({type: 'command-panel', kind: 'info', text: 'custom model input is not wired yet; edit project defaults or run setup with flags.'});
 		return;
 	}
 	if (overlay.kind === 'model') {
@@ -1242,7 +1274,7 @@ async function applyOverlaySelection(
 			project.settings.reasoning_effort = (row.value || undefined) as ProjectSettings['reasoning_effort'];
 		}
 		await saveProject(bootstrap.workdir, project);
-		dispatch({type: 'append', kind: 'info', text: `(settings updated: ${row.title})`});
+		dispatch({type: 'command-panel', kind: 'info', text: `(settings updated: ${row.title})`});
 		await refreshBootstrap();
 		reloadRuntime();
 	}
@@ -1279,7 +1311,7 @@ async function applyModelDefaults(
 	next: {provider: ProviderOption['slug']; model: string}
 ) {
 	if (!bootstrap.workdir) {
-		dispatch({type: 'append', kind: 'error', text: 'project is not ready'});
+		dispatch({type: 'command-panel', kind: 'error', text: 'project is not ready'});
 		return;
 	}
 	const project = await loadProject(bootstrap.workdir);
@@ -1289,7 +1321,7 @@ async function applyModelDefaults(
 	await saveProject(bootstrap.workdir, project);
 	await refreshBootstrap();
 	reloadRuntime();
-	dispatch({type: 'append', kind: 'info', text: `(LLM: ${composeModelTag(next.provider, next.model)})`});
+	dispatch({type: 'command-panel', kind: 'info', text: `(LLM: ${composeModelTag(next.provider, next.model)})`});
 }
 
 async function applyImageDefaults(
@@ -1300,7 +1332,7 @@ async function applyImageDefaults(
 	next: {provider: string; model: string}
 ) {
 	if (!bootstrap.workdir) {
-		dispatch({type: 'append', kind: 'error', text: 'project is not ready'});
+		dispatch({type: 'command-panel', kind: 'error', text: 'project is not ready'});
 		return;
 	}
 	const project = await loadProject(bootstrap.workdir);
@@ -1311,7 +1343,7 @@ async function applyImageDefaults(
 	await refreshBootstrap();
 	reloadRuntime();
 	dispatch({
-		type: 'append',
+		type: 'command-panel',
 		kind: 'info',
 		text: next.model ? `(image model: ${composeModelTag(next.provider, next.model)})` : '(image generation disabled)'
 	});

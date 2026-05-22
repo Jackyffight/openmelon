@@ -22,6 +22,17 @@ test('different transcript kinds do not merge', () => {
 	assert.equal(state.items[2]?.text, 'world');
 });
 
+test('slash command panel does not pollute transcript', () => {
+	let state = initialState();
+	state = reducer(state, {type: 'command-panel', kind: 'info', text: 'Commands'});
+
+	assert.equal(state.items.length, 0);
+	assert.equal(state.commandPanel?.text, 'Commands');
+
+	state = reducer(state, {type: 'insert', text: 'hello'});
+	assert.equal(state.commandPanel, null);
+});
+
 test('pending-applied removes only consumed pending inputs', () => {
 	let state = initialState();
 	state = reducer(state, {type: 'queue-pending', text: 'one'});

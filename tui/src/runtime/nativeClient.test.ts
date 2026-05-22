@@ -85,6 +85,40 @@ test('native runtime downgrades missing resume history to a fresh lazy session',
 	}
 });
 
+test('clearHistory forgets the active session and next run creates a new one', async () => {
+	const workdir = await mkdtemp(path.join(tmpdir(), 'openmelon-native-client-clear-'));
+	await writeProject(workdir);
+
+	const previousCwd = process.cwd();
+	process.chdir(workdir);
+	try {
+		const events: RuntimeEvent[] = [];
+		const client = createNativeRuntimeClient(event => events.push(event));
+		await waitFor(() => events.some(event => event.type === 'ready'));
+
+		client.run('first');
+		await waitFor(() => events.some(event => event.type === 'ready' && Boolean(event.sessionId)));
+		const firstSession = (events.find(event => event.type === 'ready' && Boolean(event.sessionId)) as {sessionId?: string}).sessionId;
+		assert.ok(firstSession);
+
+		client.clearHistory();
+		await waitFor(() => events.some(event => event.type === 'ready' && event.clearSession));
+		const clearEvent = events.find(event => event.type === 'ready' && event.clearSession) as {sessionId?: string; clearSession?: boolean};
+		assert.equal(clearEvent.sessionId, '');
+
+		client.run('second');
+		await waitFor(() => events.filter(event => event.type === 'ready' && Boolean(event.sessionId)).length >= 2);
+		const readyWithSessions = events.filter(event => event.type === 'ready' && Boolean(event.sessionId)) as Array<{sessionId?: string}>;
+		const secondSession = readyWithSessions.at(-1)?.sessionId;
+		assert.ok(secondSession);
+		assert.notEqual(secondSession, firstSession);
+		assert.equal((await listSessions(workdir)).length, 2);
+		client.shutdown();
+	} finally {
+		process.chdir(previousCwd);
+	}
+});
+
 async function writeProject(workdir: string) {
 	await mkdir(path.join(workdir, '.openmelon'), {recursive: true});
 	await writeFile(

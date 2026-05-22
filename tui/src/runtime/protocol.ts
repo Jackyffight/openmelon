@@ -7,15 +7,16 @@ export type RuntimeEvent =
 			type: 'ready';
 			status?: 'ready';
 			activity?: string;
-			model?: string;
-			reasoning?: string;
-			project?: string;
-			sessionId?: string;
-			sessionDir?: string;
-			provider?: string;
+	model?: string;
+	reasoning?: string;
+	project?: string;
+	sessionId?: string;
+	sessionDir?: string;
+	provider?: string;
+	clearSession?: boolean;
 	  }
 	| {type: 'status'; status: RuntimeStatus; activity: string}
-	| {type: 'append'; kind: TranscriptKind; text: string; delta?: boolean; markdown?: boolean}
+	| {type: 'append'; kind: TranscriptKind; text: string; delta?: boolean; markdown?: boolean; transient?: boolean}
 	| {type: 'pending-applied'; texts: string[]}
 	| {type: 'usage'; promptTokens?: number; completionTokens?: number; totalTokens?: number}
 	| {type: 'approval'; activity?: string; detail?: ApprovalRequest}
