@@ -7,7 +7,12 @@ import {SelectorPanel, type SelectorRow} from './components/SelectorPanel.js';
 import {SlashPalette} from './components/SlashPalette.js';
 import {StatusLine} from './components/StatusLine.js';
 import {Transcript} from './components/Transcript.js';
-import {createRuntimeBridge, type RuntimeBridge, type RuntimeEvent} from './runtime/processBridge.js';
+import type {RuntimeBridge, RuntimeEvent} from './runtime/types.js';
+import {createLocalRuntime} from './engine/localRuntime.js';
+
+// The all-TS in-process engine is the runtime. (The Go `runtime-bridge`
+// subprocess fallback was removed once the TS engine reached full parity.)
+const createRuntime = createLocalRuntime;
 import {randomPlaceholder} from './placeholder.js';
 import {initialState, reducer} from './state/reducer.js';
 import {discoverProject} from './core/project.js';
@@ -18,6 +23,7 @@ import {Onboarding} from './onboarding/Onboarding.js';
 import {providers, type ProviderOption} from './core/providers.js';
 import type {ProjectSettings} from './core/project.js';
 import {buildCompactionDraft, summarizeSpace} from './core/space.js';
+import {publishToVbox} from './core/publish.js';
 import {listSkills, type SkillInfo} from './core/skillplus.js';
 import {osc52Copy} from './terminal/clipboard.js';
 import type {TuiAction, TuiState, TranscriptItem} from './state/types.js';
@@ -153,7 +159,7 @@ export function App({resumeId}: Props) {
 		if (!bootstrap?.ready) {
 			return;
 		}
-		runtimeBridge.current = createRuntimeBridge(handleRuntimeEvent, {resumeId});
+		runtimeBridge.current = createRuntime(handleRuntimeEvent, {resumeId});
 		return () => runtimeBridge.current?.shutdown();
 	}, [bootstrap?.ready, handleRuntimeEvent, resumeId]);
 
@@ -161,7 +167,7 @@ export function App({resumeId}: Props) {
 		if (runtimeBridge.current?.isAvailable()) {
 			runtimeBridge.current.reload();
 		} else {
-			runtimeBridge.current = createRuntimeBridge(handleRuntimeEvent, {resumeId});
+			runtimeBridge.current = createRuntime(handleRuntimeEvent, {resumeId});
 		}
 	}, [handleRuntimeEvent, resumeId]);
 
@@ -295,6 +301,10 @@ export function App({resumeId}: Props) {
 		}
 		if (text.startsWith('/compact')) {
 			void compactCommand(text, bootstrap?.workdir ?? '', dispatch);
+			return;
+		}
+		if (text.startsWith('/publish')) {
+			void publishCommand(text, bootstrap?.workdir ?? '', dispatch);
 			return;
 		}
 		if (text === '/model') {
@@ -766,6 +776,38 @@ async function compactCommand(text: string, workdir: string, dispatch: Dispatch)
 	}
 	const draft = await buildCompactionDraft(workdir, id);
 	dispatch({type: 'append', kind: 'assistant', text: draft || '(empty compaction draft)'});
+}
+
+function parsePublishArgs(text: string): {file?: string; caption: string} {
+	const rest = text.replace(/^\/publish\s*/, '');
+	const fileMatch = rest.match(/--file\s+(\S+)\s*/);
+	if (fileMatch && fileMatch.index !== undefined) {
+		const file = fileMatch[1];
+		const caption = (rest.slice(0, fileMatch.index) + rest.slice(fileMatch.index + fileMatch[0].length)).trim();
+		return {file, caption};
+	}
+	return {caption: rest.trim()};
+}
+
+async function publishCommand(text: string, workdir: string, dispatch: Dispatch) {
+	if (!workdir) {
+		dispatch({type: 'append', kind: 'error', text: '/publish: no openmelon project here'});
+		return;
+	}
+	const {file, caption} = parsePublishArgs(text);
+	dispatch({type: 'append', kind: 'info', text: 'publishing to V-Box…'});
+	try {
+		const result = await publishToVbox({workdir, text: caption, file});
+		const where = result.imageName ?? 'text-only';
+		const id = result.contentId ? ` · ${result.contentId}` : '';
+		dispatch({
+			type: 'append',
+			kind: 'info',
+			text: `✓ submitted to V-Box review queue (${where})${id}\n  pending owner approval in the V-Box app`
+		});
+	} catch (error) {
+		dispatch({type: 'append', kind: 'error', text: `/publish: ${(error as Error).message}`});
+	}
 }
 
 async function applyModelCommand(

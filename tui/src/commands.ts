@@ -18,6 +18,7 @@ export const slashCommands: SlashCommand[] = [
 	{name: '/session', help: 'show current session information'},
 	{name: '/events', help: 'show recent runtime events'},
 	{name: '/space', help: 'show creative-space memory summary'},
+	{name: '/publish', help: 'publish latest image + caption to V-Box (review queue)'},
 	{name: '/compact', help: 'preview context compaction'},
 	{name: '/exit', help: 'exit OpenMelon'}
 ];

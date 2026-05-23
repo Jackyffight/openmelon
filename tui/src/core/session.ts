@@ -1,6 +1,9 @@
 import {promises as fs} from 'node:fs';
+import {randomBytes} from 'node:crypto';
 import path from 'node:path';
 import {stateDir} from './project.js';
+
+export const sessionSchemaVersion = 2;
 
 export type SessionMeta = {
 	version?: number;
@@ -132,4 +135,101 @@ async function loadSessionMeta(workdir: string, id: string) {
 
 function sessionsDir(workdir: string) {
 	return path.join(stateDir(workdir), 'sessions');
+}
+
+// --- write side (ported from internal/session) ---
+
+/** A writable session directory: appends messages/events, writes the summary. */
+export type WritableSession = {
+	id: string;
+	dir: string;
+	startedAt: Date;
+	/** Persist each message as one JSONL line (on-disk snake_case shape). */
+	appendMessages(messages: ChatMessage[]): Promise<void>;
+	/** Write the final summary.json. */
+	writeSummary(summary: string, artifacts: string[], finished: boolean): Promise<void>;
+	/** Record provider/model into meta.json. */
+	setRuntimeInfo(provider: string, model: string): Promise<void>;
+	appendEvent(event: SessionEvent): Promise<void>;
+};
+
+function utcStamp(d: Date): string {
+	const p = (n: number) => String(n).padStart(2, '0');
+	return `${d.getUTCFullYear()}${p(d.getUTCMonth() + 1)}${p(d.getUTCDate())}-${p(d.getUTCHours())}${p(d.getUTCMinutes())}${p(d.getUTCSeconds())}`;
+}
+
+/**
+ * Create a fresh session under <workdir>/.openmelon/sessions/<id>/, writing
+ * meta.json. The id is "<UTC timestamp>-<8 hex>" so listings sort
+ * chronologically. The on-disk message shape matches the Go reader so
+ * `openmelon resume` (and the legacy Go binary) stay compatible.
+ */
+export async function createSession(
+	workdir: string,
+	projectId: string,
+	intent: string,
+	resumedFrom = ''
+): Promise<WritableSession> {
+	const now = new Date();
+	const id = `${utcStamp(now)}-${randomBytes(4).toString('hex')}`;
+	const dir = path.join(sessionsDir(workdir), id);
+	await fs.mkdir(dir, {recursive: true});
+
+	let provider = '';
+	let model = '';
+
+	async function writeMeta(): Promise<void> {
+		const meta: SessionMeta = {
+			version: sessionSchemaVersion,
+			id,
+			project_id: projectId,
+			intent,
+			started_at: now.toISOString(),
+			workspace_root: workdir
+		};
+		if (provider) {
+			meta.provider = provider;
+		}
+		if (model) {
+			meta.model = model;
+		}
+		if (resumedFrom) {
+			meta.resumed_from = resumedFrom;
+		}
+		await fs.writeFile(path.join(dir, 'meta.json'), `${JSON.stringify(meta, null, 2)}\n`);
+	}
+
+	await writeMeta();
+
+	return {
+		id,
+		dir,
+		startedAt: now,
+		async appendMessages(messages) {
+			if (messages.length === 0) {
+				return;
+			}
+			const body = messages.map(m => JSON.stringify(m)).join('\n') + '\n';
+			await fs.appendFile(path.join(dir, 'messages.jsonl'), body);
+		},
+		async writeSummary(summary, artifacts, finished) {
+			const payload = {
+				id,
+				finished,
+				summary,
+				artifacts,
+				finished_at: new Date().toISOString()
+			};
+			await fs.writeFile(path.join(dir, 'summary.json'), `${JSON.stringify(payload, null, 2)}\n`);
+		},
+		async setRuntimeInfo(p, m) {
+			provider = p.trim();
+			model = m.trim();
+			await writeMeta();
+		},
+		async appendEvent(event) {
+			const rec = {at: new Date().toISOString(), ...event};
+			await fs.appendFile(path.join(dir, 'events.jsonl'), `${JSON.stringify(rec)}\n`);
+		}
+	};
 }

@@ -1,6 +1,7 @@
 # Architecture
 
-OpenMelon is a content-production runtime built around two core abstractions:
+OpenMelon is a pure-TypeScript (Node) content-production runtime built around two core
+abstractions:
 
 - **Project** — a directory under `<workdir>/.openmelon/` holding the agent's persistent state: characters, references, session logs, settings, credentials.
 - **Tool loop** — a ReAct-style agent where the model decides which tools to call against the project on each turn.
@@ -11,7 +12,10 @@ OpenMelon is a content-production runtime built around two core abstractions:
 |---|---|---|
 | Interactive TUI | `openmelon` (no args) | Day-to-day creator workflow |
 | Headless one-shot | `openmelon -p "<intent>"` | Scripts, sub-agent integration, CI |
-| Legacy declarative workflow | `openmelon --project <path>` | Pre-0.3 staged pipelines (still supported) |
+| Management CLI | `openmelon <character\|space\|project\|…>` | Curate the project's libraries + spaces |
+
+The agent loop runs **in-process** (`engine/localRuntime.ts` for the TUI, `commands/headless.ts`
+for `-p`) — there is no separate runtime process.
 
 ## Tool loop
 
@@ -69,12 +73,18 @@ Mode lives at `project.json:settings.bash_permission_mode`. Defaults to strict. 
 
 Each `openmelon` launch (or `openmelon resume`) creates a new session dir. `messages.jsonl` records the conversation incrementally; `meta.json` records project id, intent, timestamps, and `resumed_from` for traceability. Sessions are append-only: resuming creates a new dir, the original is untouched.
 
-## LLM interfaces
+## LLM interfaces (`engine/llm/`)
 
-- `llm.Client.{Complete, Stream}` — single-turn text completion. Used by the legacy agent.
-- `llm.ToolCaller.Chat` — multi-turn message list with tool calls.
-- `llm.StreamingToolCaller.StreamChat` — same plus token-by-token streaming. Uses `stream_options.include_usage=true`; the final chunk carries the Usage block. Tool-call deltas are reassembled by `tool_call_index` since vendors split `function.arguments` across many chunks.
+- `LLMClient.chat(req)` — multi-turn message list with tool calls (required).
+- `LLMClient.streamChat(req, handlers)` — optional; token-by-token streaming. The runtime
+  prefers it when present, else falls back to `chat`. OpenAI/OpenRouter use
+  `stream_options.include_usage=true` (final chunk carries Usage); tool-call deltas are
+  reassembled by `tool_calls[].index` since vendors split `function.arguments` across chunks.
+- Providers: OpenAI + OpenRouter (`openai.ts`, streaming) and Anthropic (`anthropic.ts`,
+  Messages API with tool use). `factory.newLLM(provider,…)` selects, with env auto-detect.
 
 ## API key resolution
 
-Project credentials.json → global credentials.json → environment variable. Both the TUI and headless `-p` use `userconfig.ResolveAPIKey(workdir, provider)`.
+`core/config.resolveProvider(workdir, provider)`: project.json providers → global config
+providers → project `.openmelon/credentials.json` → global `~/.openmelon/credentials.json` →
+environment variable. Both the TUI and headless `-p` use it.

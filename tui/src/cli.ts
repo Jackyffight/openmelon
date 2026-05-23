@@ -1,26 +1,10 @@
-import {spawn} from 'node:child_process';
-import {existsSync} from 'node:fs';
-import path from 'node:path';
-import {fileURLToPath} from 'node:url';
 import {discoverProject} from './core/project.js';
 import {listSessions, validateSessionWorkspace} from './core/session.js';
 import {runTui} from './main.js';
 import {runInitCommand} from './commands/init.js';
 import {runSetupCommand} from './commands/setup.js';
-
-const legacySubcommands = new Set([
-	'project',
-	'character',
-	'reference',
-	'material',
-	'search',
-	'space',
-	'session',
-	'runtime-bridge',
-	'help',
-	'-h',
-	'--help'
-]);
+import {runManage, tsManagedCommands} from './commands/manage.js';
+import {parseHeadless, runHeadless} from './commands/headless.js';
 
 export async function main(argv = process.argv.slice(2)) {
 	const [command, ...rest] = argv;
@@ -45,11 +29,32 @@ export async function main(argv = process.argv.slice(2)) {
 		return;
 	}
 
-	if (legacySubcommands.has(command) || command.startsWith('-')) {
-		await runLegacy(argv);
+	if (command === 'help' || command === '-h' || command === '--help') {
+		printUsage();
 		return;
 	}
 
+	// character / reference / material / search / session / project / space are now pure TS.
+	if (tsManagedCommands.has(command)) {
+		await runManage(command, rest);
+		return;
+	}
+
+	// Headless one-shot: `openmelon -p "<intent>"` (pure TS).
+	const headless = parseHeadless(argv);
+	if (headless) {
+		await runHeadless(headless);
+		return;
+	}
+
+	if (command.startsWith('-')) {
+		console.error(`openmelon: unknown flag ${command}`);
+		printUsage();
+		process.exitCode = 1;
+		return;
+	}
+
+	// Anything else: treat the whole argv as a prompt and open the TUI.
 	await runTui({argv});
 }
 
@@ -81,39 +86,6 @@ async function handleResume(args: string[]) {
 	await runTui({argv: [], resumeId: id});
 }
 
-async function runLegacy(args: string[]) {
-	const binary = resolveLegacyBinary();
-	await new Promise<void>((resolve, reject) => {
-		const child = spawn(binary, args, {stdio: 'inherit', cwd: process.cwd(), env: process.env});
-		child.on('error', reject);
-		child.on('exit', (code, signal) => {
-			if (signal) {
-				process.kill(process.pid, signal);
-				return;
-			}
-			if (code && code !== 0) {
-				process.exitCode = code;
-				resolve();
-				return;
-			}
-			resolve();
-		});
-	});
-}
-
-function resolveLegacyBinary() {
-	if (process.env.OPENMELON_RUNTIME_BIN) {
-		return process.env.OPENMELON_RUNTIME_BIN;
-	}
-
-	const here = path.dirname(fileURLToPath(import.meta.url));
-	const repoBinary = path.resolve(here, '..', '..', 'openmelon');
-	if (existsSync(repoBinary)) {
-		return repoBinary;
-	}
-	return 'openmelon';
-}
-
 function formatWhen(date: Date) {
 	if (Number.isNaN(date.getTime())) {
 		return '(unknown)';
@@ -123,6 +95,24 @@ function formatWhen(date: Date) {
 
 function truncate(text: string, max: number) {
 	return text.length > max ? `${text.slice(0, max)}…` : text;
+}
+
+function printUsage() {
+	console.log(`openmelon — a content-creation agent in your terminal.
+
+Usage:
+  openmelon                      open the interactive TUI (in a project)
+  openmelon -p "<intent>"        headless one-shot agent run
+  openmelon init                 create a project here
+  openmelon setup                configure provider keys + model defaults
+  openmelon resume [<id>]        resume a prior session
+  openmelon project <list|use|show|keys|set-key|unset-key>
+  openmelon character|reference|material <add|list|show|rm>
+  openmelon search <query>...    grep characters/references/materials
+  openmelon space <create|activate|list|show|context|search|decision|feedback|memory|promote|episode|asset|asset-weight|compact>
+  openmelon session events <id>
+
+Run \`openmelon <command>\` with no args for that command's usage.`);
 }
 
 main().catch(error => {

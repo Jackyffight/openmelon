@@ -60,6 +60,47 @@ export function outputsDir(workdir: string) {
 	return path.join(workdir, 'outputs');
 }
 
+/** Visible output directory for one generation session. */
+export function sessionOutputDir(workdir: string, sessionId: string) {
+	const id = sessionId.trim() || 'session';
+	return path.join(outputsDir(workdir), 'sessions', id);
+}
+
+/** Default visible directory for a promoted artifact bucket. */
+export function artifactOutputDir(workdir: string, slug: string, timestamp: string) {
+	return path.join(outputsDir(workdir), 'artifacts', slug, timestamp);
+}
+
+function pathInside(parent: string, child: string) {
+	const rel = path.relative(parent, child);
+	return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+}
+
+/**
+ * Resolve a user/model-selected output directory inside the project. Empty
+ * `requested` uses `fallback`, then <workdir>/outputs. Paths under .openmelon
+ * are rejected (reserved for internal state); paths escaping the workdir too.
+ */
+export function resolveOutputDir(workdir: string, requested: string, fallback: string) {
+	const absWorkdir = path.resolve(workdir);
+	const req = requested.trim();
+	let out = fallback;
+	if (req) {
+		out = path.isAbsolute(req) ? req : path.join(absWorkdir, req);
+	}
+	if (!out.trim()) {
+		out = outputsDir(absWorkdir);
+	}
+	const absOut = path.resolve(out);
+	if (!pathInside(absWorkdir, absOut)) {
+		throw new Error(`output dir ${JSON.stringify(requested)} escapes project workdir`);
+	}
+	if (pathInside(stateDir(absWorkdir), absOut)) {
+		throw new Error(`output dir ${JSON.stringify(requested)} is inside .openmelon; choose a visible project directory`);
+	}
+	return absOut;
+}
+
 export async function initProject(workdir: string, project: ProjectConfig) {
 	const existing = await discoverProject(workdir);
 	if (existing === path.resolve(workdir)) {

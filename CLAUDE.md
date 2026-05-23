@@ -4,132 +4,113 @@ Guidance for Claude Code (claude.ai/code) when working in this repo.
 
 ## What this is
 
-`openmelon` is a content-creation agent CLI. Three usage modes:
+`openmelon` is a content-creation agent CLI — **pure TypeScript / Node**. (It was
+originally Go + a thin npm wrapper; the entire engine and CLI were migrated to
+TypeScript — see `tui/ENGINE_MIGRATION.md` for the history. There is no Go left.)
 
-1. **Interactive TUI** — `openmelon` (no args, in a project) drops into a bubbletea REPL with slash commands, palette, model + skill pickers, bash approval modal, session resume.
-2. **Headless prompt** — `openmelon -p "<intent>"`. Inside an OpenMelon project, runs the same tool-driven runtime as the TUI without the TUI. Outside a project, falls back to the legacy one-shot skillplus → LLM JSON → optional image/artifact path. Used by integrations and scripts.
-3. **Public Go surface** — `pkg/openmelon` currently exposes version metadata; `pkg/contracts` holds public contract types for embedding/integration surfaces.
+The whole product lives in **`tui/`** and ships as the npm package `@e8s/openmelon`.
 
-> Repo: https://github.com/eight-acres-lab/openmelon
-> Module: `github.com/eight-acres-lab/openmelon`
+Three usage modes:
 
-## Layout
+1. **Interactive TUI** — `openmelon` (no args, inside a project) opens an Ink/React
+   REPL with slash commands, a model/skill picker, a bash approval modal, and session
+   resume.
+2. **Headless one-shot** — `openmelon -p "<intent>"`. Same engine, no TUI; streams
+   progress to stderr, records the run to a session dir.
+3. **Management CLI** — `openmelon <character|reference|material|search|space|project|
+   session|init|setup|resume>`.
+
+> Repo: https://github.com/eight-acres-lab/openmelon · package: `@e8s/openmelon`
+
+## Layout (everything is under `tui/`)
 
 ```
-cmd/openmelon/
-  main.go               subcommand dispatch + legacy flag-based one-shot
-  cmd_init.go           openmelon init
-  cmd_project.go        project list|use|show|set-key|unset-key|keys
-  cmd_registry.go       character / reference / material add|list|show|rm
-  cmd_search.go         openmelon search
-  cmd_repl.go           runRepl: builds runtime + dispatches TUI vs bufio
-  cmd_resume.go         openmelon resume [<id>]
-  cmd_setup.go          openmelon setup (re-run auth wizard)
-  agent_runtime.go      headless `-p` path inside a project
-  publish.go            --publish vbox helper
+tui/
+  bin/openmelon.js          launcher: runs dist/cli.js (built) or src/cli.ts via tsx (dev)
+  src/
+    cli.ts                  subcommand dispatch (init/setup/resume/-p/help + management)
+    main.tsx                Ink entry (runTui)
+    App.tsx                 the TUI: state machine, slash commands, overlays, approval modal
+    commands/
+      init.ts setup.ts      project init + key/model wizard
+      manage.ts             character/reference/material/search/session/project/space CLI
+      headless.ts           `-p` one-shot runner
+    components/             Ink components (Header, Transcript, PromptInput, …)
+    core/                   project (projectx), config (userconfig + credentials),
+                            session (read+write), skillplus (subprocess), fs, providers
+    engine/                 THE AGENT ENGINE (all in-process TS):
+      llm/{types,sse,openai,anthropic,factory}.ts
+                            cross-vendor chat+tools; OpenAI/OpenRouter (streaming) +
+                            Anthropic (tool use). factory: newLLM(provider,…) + auto-detect
+      runtime.ts            ReAct loop (Tracer, finish tool, drainUserInput, maxSteps)
+      tools/{registry,builtin,bash,continuity}.ts
+                            24 tools: read-only library + 13 continuity + compile_skill +
+                            generate_image + save_artifact + bash (4-tier gate) + finish
+      imagegen.ts           OpenRouter (chat-completions image) + OpenAI image; refs; retry
+      registry.ts           characters/references/materials on-disk store (read+write)
+      search.ts             tag+grep search
+      continuity.ts         creative-space store (spaces/canon/decisions/episodes/assets…)
+      systemPrompt.ts       buildProjectSystemPrompt + resolveDefaults + resolveReasoningEffort
+      localRuntime.ts       in-process RuntimeBridge the TUI drives (Tracer→RuntimeEvent)
+    runtime/types.ts        RuntimeBridge / RuntimeEvent shared types
+    state/ terminal/        TUI reducer + terminal helpers
+  tsconfig.json             typecheck (NodeNext, strict)
+  tsconfig.build.json       emit to dist/
+  ENGINE_MIGRATION.md       migration record (architecture, slices, gotchas)
 
-internal/
-  userconfig/           ~/.openmelon/{config,credentials,projects}.json
-                        + IsTrusted / ResolveAPIKey (project → global → env)
-  projectx/             <workdir>/.openmelon/project.json + Settings + .gitignore
-  registry/             characters / references / materials on-disk store
-                        (.search files, source-of-truth for description + tags)
-  search/               tag + grep, no vectors
-  llm/                  pluggable Client (Complete/Stream) + ToolCaller (Chat)
-                        + StreamingToolCaller (StreamChat) + Usage tracking
-  imagegen/             pluggable Generator with ReferenceImages support
-                        + retry on transient TLS / 5xx + DisableKeepAlives
-  tools/                tool registry + builtin tools (list_characters,
-                        get_character, search, compile_skill, generate_image,
-                        save_artifact, bash, finish, ...)
-                        + bash judge LLM + per-session allowlist
-  runtime/              tool-using agent loop driven by llm.ToolCaller
-                        + Tracer interface + History support for multi-turn
-  session/              per-run messages.jsonl + meta.json + Recent / LoadHistory
-  onboard/              first-run wizards (trust → auth → project init) as
-                        ONE alt-screen bubbletea program with state machine
-                        + providers.go (public Provider / Preset for /model)
-  tui/                  bubbletea TUI: model.go (state machine), tui.go (entry),
-                        tracer.go (runtime → tea.Msg bridge), style.go, keys.go,
-                        messages.go (per-event tea.Msg types)
-  repl/                 bufio fallback REPL for non-tty contexts (CI, pipes)
-  skillplus/            subprocess wrapper to the `skillplus` CLI + ListSkills
-  agent/                legacy 0.2 one-shot agent (used outside a project)
-  artifacts/            legacy artifact write helper
-  provenance/           legacy provenance JSONL helper
-  project/              legacy 0.1 project.json loader
-  workflow/             legacy 0.1 declarative workflow runner
-  generation/           legacy 0.1 generation providers (shell + LLM-backed adapter)
-  version/
-
-pkg/
-  contracts/            public Go types
-  openmelon/            public version metadata (Version constant lives here)
-
-npm/                    @e8s/openmelon Node distribution (downloads the binary)
-examples/
-  food-exploration/     legacy 0.1 declarative example
-  integrations/         Skill files for Claude Code, Cursor
-assets/                 logo + provenance
-docs/                   design notes, testing recipe
-scripts/release.sh      tag + build × 4 platforms + GH release + npm publish
+Makefile                    build/check/dev/start/install (delegates to tui/)
+scripts/release.sh          tag + build + npm publish @e8s/openmelon
+docs/ examples/ config/ assets/   design notes, sample projects, brand
 ```
 
 ## Commands
 
 ```bash
-go build -ldflags "-X github.com/eight-acres-lab/openmelon/internal/version.Version=$(git describe --tags --always)" -o ./openmelon ./cmd/openmelon
-go test ./...
+make build          # cd tui && npm install --ignore-scripts && npm run build
+make check          # typecheck
+make dev            # run the TUI from source (tsx)
 
-# Local install for testing:
-go install -ldflags "-X github.com/eight-acres-lab/openmelon/internal/version.Version=v0.x-dev" ./cmd/openmelon
+# Inside tui/:
+node node_modules/typescript/bin/tsc --noEmit   # typecheck (see sandbox note below)
+npm run build && node dist/cli.js               # run the compiled CLI
 ```
 
 ## Architecture conventions
 
-- **Module path**: `github.com/eight-acres-lab/openmelon`.
+- **On-disk state** lives under `<project>/.openmelon/` (project.json, credentials.json,
+  sessions/, characters/, references/, materials/, spaces/). User-facing outputs go under
+  `<project>/outputs/` — never write deliverables into `.openmelon`.
+- **API key resolution** (`core/config.resolveProvider`): project.json providers → global
+  config providers → project credentials.json → global credentials.json → env var.
+- **No vendor model defaults baked into source.** Constructors throw `ModelRequiredError`
+  when no model id is given; models come from the auth wizard / project defaults.
+- **The engine is provider-agnostic.** Anything implementing `engine/llm/types.LLMClient`
+  works; the runtime prefers `streamChat` when present, else `chat`.
+- **Tools** return JSON-serializable values; a tool that returns `{error: …}` is surfaced to
+  the model so it can self-correct. Tool param schemas are hand-written JSON Schema.
+- **bash** is gated 4 ways: trusted-mode bypass → per-session allowlist → LLM judge
+  (AUTO/ASK/BLOCK, fail-safe to ASK) → user approval modal. Headless `-p` has no modal
+  (judge-only); use `bash_permission_mode: auto|trusted` in project.json for headless bash.
+- **skillplus** is a subprocess (`skillplus` console script, or `python3 -m skillplus`).
+- **Publishing to V-Box** uses the bundled `@e8s/vbox-cli` library (`core/publish.ts`,
+  `/publish` slash command) — `uploadMedia` + `BCPClient.post` into the owner's review queue.
 
-- **Dep policy** (per package):
-  - `internal/llm`, `internal/imagegen`, `internal/registry`, `internal/projectx`, `internal/userconfig`, `internal/runtime`, `internal/tools`, `internal/session`, `internal/search`: pure stdlib + net/http + encoding/json. No vendor SDKs. No YAML / CLI-parser deps.
-  - `internal/tui` and `internal/onboard`: Charm stack allowed (bubbletea, lipgloss, bubbles, textinput, textarea, viewport, spinner, key). These are the canonical Go TUI framework and impossible to replicate in stdlib. Confine to these two packages so the runtime stays light.
-  - `cmd/openmelon`: imports anything; orchestrates.
+## Adding things
 
-- **Slug rules are uniform.** `projectx.ValidateID` and `registry.ValidateSlug` both require kebab-case `[a-z][a-z0-9-]*`, len 2–64. Material slugs are `m-<hex>` so the hash satisfies the rule.
+- **A tool**: add a `ToolDef` in `engine/tools/builtin.ts` (or a sibling) and register it in
+  `buildRegistry`. Mirror the Go-era JSON-schema style.
+- **An LLM provider**: implement `LLMClient` in `engine/llm/`, wire it into
+  `engine/llm/factory.newLLM` + auto-detect.
+- **An image provider**: implement `ImageGenerator` in `engine/imagegen.ts`, wire into
+  `newImageGenerator`.
+- **A slash command**: add to `src/commands.ts` `slashCommands` + a branch in `App.tsx`'s
+  dispatch (heavier ones delegate to an async helper).
 
-- **No vendor model defaults baked into source.** Code returns `ErrModelRequired` when no model id is passed. Users get curated preset lists via the auth wizard / `/model` selector (see `internal/onboard/auth.go:providerOptions`); choices are persisted to `project.json:defaults` and `~/.openmelon/config.json:defaults`.
+## Sandbox / tooling notes
 
-- **Subprocess to skillplus.** Don't reimplement skill compilation in Go. Contract is JSON-in / JSON-out via `internal/skillplus`. `ListSkills` shells `skillplus list --json`.
-
-- **Tool dispatch is synchronous from a worker goroutine.** The bash tool's approval flow uses a reply channel + tea.Msg to bridge into the bubbletea event loop. See `tools/bash.go` + `tui/messages.go:approvalRequestMsg`.
-
-- **The bash tool is gated by 4 tiers**: trusted-mode bypass → per-session allowlist → judge LLM (AUTO/ASK/BLOCK) → user modal. Mode is `project.json:settings.bash_permission_mode` (strict/auto/trusted). Headless `-p` wires the judge but no user approval modal: `auto` can run judge-AUTO commands, judge-ASK commands fail without an approval gate, `strict` requires approval for non-blocked commands and therefore fails headless, and `trusted` bypasses checks.
-
-- **API key resolution order**: project credentials.json → global credentials.json → env var (e.g. `OPENROUTER_API_KEY`). Both TUI and headless `-p` go through `userconfig.ResolveAPIKey(workdir, provider)`.
-
-- **Sessions are append-only.** A new session dir is created per `openmelon` launch (or per `openmelon resume`); the prior dir is never modified. `meta.json` records `resumed_from` for traceability.
-
-- **Streaming**: `llm.StreamingToolCaller.StreamChat` parses SSE, fires `OnText` for each text delta, accumulates tool-call deltas (vendors split function.arguments across many chunks) into a single ToolCall list at the end. `stream_options.include_usage=true` makes the final chunk carry the Usage block.
-
-- **TUI rendering**: viewport content is bottom-anchored when transcript is shorter than the viewport (pad with leading newlines). The textarea auto-grows from 1 line up to 10 as the user types newlines. Active state replaces the input area entirely (running spinner, /settings, /model, /skill, approval modal).
-
-## Adding an LLM provider
-
-1. Implement `llm.Client` (Complete + Stream + Provider + Model). For tool-use support, also implement `ToolCaller.Chat` and ideally `StreamingToolCaller.StreamChat`. Reuse `internal/llm/sse.go` for SSE parsing.
-2. Register the constructor in `llm.New` (factory.go).
-3. Add a row to `internal/onboard/auth.go:providerOptions` so the auth wizard / `/model` selector know about it.
-
-## Adding an image provider
-
-1. Implement `imagegen.Generator` (Generate + Provider + Model). Honor `GenerateOptions.ReferenceImages`. Use `freshTransport()` and `transientHTTPDo` for the HTTP client (see `internal/imagegen/retry.go`).
-2. Register in `imagegen.New` (factory.go).
-3. Add to the relevant providerOptions row's `imagePresets`.
-
-## Adding a slash command
-
-1. Append to `slashCommands` in `internal/tui/model.go`.
-2. Add a `case "/<name>"` branch in `handleSlash`.
-3. If it needs its own state, add a `state*` constant + `update*` + `render*` + an `overlayRows` entry in `recomputeLayout`.
-
-## Versioning
-
-`internal/version/version.go` defaults to `"dev"`. `pkg/openmelon/openmelon.go` exposes the `Version` constant for embedded use. Release builds override via `-ldflags` (see `scripts/release.sh`).
+- Install with `npm install --ignore-scripts` — a plain install runs esbuild's postinstall
+  (a `tsx` dep) which can fail in restricted sandboxes and abort the whole install. Verify
+  `node_modules/typescript` survives.
+- In sandboxes where `.bin` isn't linked, invoke tsc as
+  `node node_modules/typescript/bin/tsc`. Behavioral tests: build to `dist/` then run plain
+  JS with `node` (tsx/esbuild can't spawn in some sandboxes).

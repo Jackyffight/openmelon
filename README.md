@@ -57,10 +57,13 @@ Same image model (`google/gemini-2.5-flash-image`), one shot each. The differenc
 npm install -g @e8s/openmelon @e8s/skillplus
 ```
 
-The npm package downloads the matching Go binary from GitHub Releases and verifies it against `SHASUMS256.txt`. To build from source:
+openmelon is a pure-Node package (requires Node ≥20) — `npm install -g` is all you need.
+To run from source:
 
 ```bash
-go install github.com/eight-acres-lab/openmelon/cmd/openmelon@latest
+git clone https://github.com/eight-acres-lab/openmelon && cd openmelon
+make build           # installs deps + compiles tui/ → tui/dist
+node tui/dist/cli.js # or: make dev  (runs from source via tsx)
 ```
 
 ## Configuration
