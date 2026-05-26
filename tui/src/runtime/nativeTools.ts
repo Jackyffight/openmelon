@@ -2,6 +2,7 @@ import {promises as fs} from 'node:fs';
 import path from 'node:path';
 import {createHash} from 'node:crypto';
 import {spawn} from 'node:child_process';
+import {createRequire} from 'node:module';
 import {outputsDir, stateDir} from '../core/project.js';
 import {listSkills} from '../core/skillplus.js';
 import {
@@ -751,9 +752,27 @@ function normalizeLocale(value: string) {
 	return value;
 }
 
+// openmelon bundles @e8s/vbox-cli; expose its bin (and any other bundled bin)
+// on the agent's bash PATH so the model can run `vbox-cli` to publish to V-Box
+// with no extra install. Computed once.
+let cachedBashPath: string | undefined;
+function bashEnv(): NodeJS.ProcessEnv {
+	if (cachedBashPath === undefined) {
+		const base = process.env.PATH ?? '';
+		try {
+			const pkgJson = createRequire(import.meta.url).resolve('@e8s/vbox-cli/package.json');
+			const binDir = path.join(path.dirname(pkgJson), '..', '..', '.bin');
+			cachedBashPath = `${binDir}${path.delimiter}${base}`;
+		} catch {
+			cachedBashPath = base;
+		}
+	}
+	return {...process.env, PATH: cachedBashPath};
+}
+
 function runProcess(command: string, args: string[], cwd: string, signal: AbortSignal) {
 	return new Promise<{stdout: string; stderr: string; code: number}>((resolve, reject) => {
-		const child = spawn(command, args, {cwd, env: process.env, stdio: ['ignore', 'pipe', 'pipe'], signal});
+		const child = spawn(command, args, {cwd, env: bashEnv(), stdio: ['ignore', 'pipe', 'pipe'], signal});
 		let stdout = '';
 		let stderr = '';
 		child.stdout.setEncoding('utf8');

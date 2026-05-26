@@ -1,107 +1,52 @@
 #!/usr/bin/env bash
-# Release a new openmelon version.
+# Release a new openmelon version (pure-TypeScript npm package in tui/).
 #
-#   ./scripts/release.sh v0.2.0       # tag + build + GitHub release + npm publish
-#   ./scripts/release.sh v0.2.0 --dry-run
+#   ./scripts/release.sh v0.4.0            # tag + build + npm publish
+#   ./scripts/release.sh v0.4.0 --dry-run
 #
-# Refuses to run with an unclean working tree. Builds darwin/linux ×
-# amd64/arm64 binaries with the version baked in via -ldflags. Bumps
-# npm/package.json so @e8s/openmelon's postinstall fetches binaries
-# from the matching GitHub Release.
+# Refuses to run with an unclean working tree. Builds tui/ and publishes
+# @e8s/openmelon to npm (prepublishOnly compiles dist/). No native binaries
+# are produced — openmelon is plain Node now.
 
 set -euo pipefail
 
 VERSION="${1:-}"
 DRY_RUN=""
-[[ "${2:-}" == "--dry-run" ]] && DRY_RUN=1
+[ "${2:-}" = "--dry-run" ] && DRY_RUN="1"
 
-if [[ -z "$VERSION" ]]; then
-  echo "usage: $0 <version> [--dry-run]" >&2
-  echo "       e.g. $0 v0.2.0" >&2
+if [ -z "$VERSION" ]; then
+  echo "usage: $0 vX.Y.Z [--dry-run]" >&2
   exit 2
 fi
+case "$VERSION" in
+  v*) ;;
+  *) echo "version must start with 'v' (e.g. v0.4.0)" >&2; exit 2 ;;
+esac
 
-if ! [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-z0-9.]+)?$ ]]; then
-  echo "version must look like v0.2.0 or v0.2.0-rc1, got: $VERSION" >&2
-  exit 2
-fi
-
-NPM_VERSION="${VERSION#v}"   # 0.2.0 (no v prefix for npm)
-
-if [[ -n "$(git status --porcelain)" ]]; then
-  echo "working tree is dirty; commit or stash first" >&2
-  git status --short
-  exit 1
-fi
-
-if git rev-parse "$VERSION" >/dev/null 2>&1; then
-  echo "tag $VERSION already exists" >&2
+if [ -n "$(git status --porcelain)" ]; then
+  echo "working tree is not clean; commit or stash first" >&2
   exit 1
 fi
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-DIST="$ROOT/dist/$VERSION"
-mkdir -p "$DIST"
+cd "$ROOT/tui"
 
-LDFLAGS="-X github.com/eight-acres-lab/openmelon/internal/version.Version=$VERSION -s -w"
+# Sync package.json version to the tag (strip leading v).
+npm version "${VERSION#v}" --no-git-tag-version
 
-build_one() {
-  local goos="$1" goarch="$2"
-  local out="$DIST/openmelon-${VERSION}-${goos}-${goarch}"
-  [[ "$goos" == "windows" ]] && out="$out.exe"
-  echo "  → $goos/$goarch"
-  GOOS="$goos" GOARCH="$goarch" CGO_ENABLED=0 \
-    go build -ldflags "$LDFLAGS" -o "$out" ./cmd/openmelon
-  (cd "$DIST" && shasum -a 256 "$(basename "$out")" >> SHASUMS256.txt)
-}
+npm install --ignore-scripts
+npm run check
+npm run build
 
-echo "==> running tests"
-go test ./... > /dev/null
-
-echo "==> building binaries → $DIST"
-rm -f "$DIST/SHASUMS256.txt"
-build_one darwin amd64
-build_one darwin arm64
-build_one linux  amd64
-build_one linux  arm64
-
-echo "==> built artifacts:"
-ls -lh "$DIST"
-
-echo "==> bumping npm/package.json to $NPM_VERSION"
-(cd "$ROOT/npm" && npm version "$NPM_VERSION" --no-git-tag-version --allow-same-version > /dev/null)
-
-if [[ -n "$DRY_RUN" ]]; then
-  echo "==> --dry-run: showing what npm would publish"
-  (cd "$ROOT/npm" && npm publish --dry-run --access public)
-  echo "==> --dry-run; reverting npm bump and stopping before tag + release"
-  (cd "$ROOT/npm" && git checkout -- package.json)
+if [ -n "$DRY_RUN" ]; then
+  echo "[dry-run] would: npm publish --access public; git tag $VERSION"
+  npm pack --dry-run
   exit 0
 fi
 
-echo "==> committing npm version bump (if needed)"
-git add npm/package.json
-if git diff --cached --quiet; then
-  echo "    (no version-bump changes — npm/package.json already at $NPM_VERSION)"
-else
-  git commit -s -m "chore: release $VERSION"
-fi
-
-echo "==> tagging $VERSION"
-git tag -a "$VERSION" -m "Release $VERSION"
-git push origin main "$VERSION"
-
-echo "==> creating GitHub release"
-gh release create "$VERSION" \
-  --title "$VERSION" \
-  --generate-notes \
-  "$DIST"/openmelon-* \
-  "$DIST"/SHASUMS256.txt
-
-echo "==> npm publish (@e8s/openmelon@$NPM_VERSION)"
-(cd "$ROOT/npm" && npm publish --access public)
-
-echo ""
-echo "==> done."
-echo "    GitHub: https://github.com/eight-acres-lab/openmelon/releases/tag/$VERSION"
-echo "    npm:    https://www.npmjs.com/package/@e8s/openmelon/v/$NPM_VERSION"
+npm publish --access public
+cd "$ROOT"
+git add tui/package.json
+git commit -m "chore: release $VERSION"
+git tag "$VERSION"
+echo "Published @e8s/openmelon $VERSION. Push with: git push && git push --tags"

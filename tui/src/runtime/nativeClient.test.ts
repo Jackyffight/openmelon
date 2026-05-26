@@ -10,6 +10,7 @@ test('native runtime creates a session lazily on first run', async () => {
 	const workdir = await mkdtemp(path.join(tmpdir(), 'openmelon-native-client-'));
 	await writeProject(workdir);
 
+	const restoreHome = await useTempGlobalConfig();
 	const previousCwd = process.cwd();
 	process.chdir(workdir);
 	try {
@@ -27,6 +28,7 @@ test('native runtime creates a session lazily on first run', async () => {
 		client.shutdown();
 	} finally {
 		process.chdir(previousCwd);
+		restoreHome();
 	}
 });
 
@@ -44,6 +46,7 @@ test('native runtime resumes the same session instead of creating a child sessio
 		`${JSON.stringify({role: 'user', content: 'old turn'})}\n`
 	);
 
+	const restoreHome = await useTempGlobalConfig();
 	const previousCwd = process.cwd();
 	process.chdir(workdir);
 	try {
@@ -56,6 +59,7 @@ test('native runtime resumes the same session instead of creating a child sessio
 		client.shutdown();
 	} finally {
 		process.chdir(previousCwd);
+		restoreHome();
 	}
 });
 
@@ -69,6 +73,7 @@ test('native runtime downgrades missing resume history to a fresh lazy session',
 		JSON.stringify({id: missingHistory, project_id: 'proj', started_at: new Date().toISOString(), workspace_root: workdir})
 	);
 
+	const restoreHome = await useTempGlobalConfig();
 	const previousCwd = process.cwd();
 	process.chdir(workdir);
 	try {
@@ -82,6 +87,7 @@ test('native runtime downgrades missing resume history to a fresh lazy session',
 		client.shutdown();
 	} finally {
 		process.chdir(previousCwd);
+		restoreHome();
 	}
 });
 
@@ -89,6 +95,7 @@ test('clearHistory forgets the active session and next run creates a new one', a
 	const workdir = await mkdtemp(path.join(tmpdir(), 'openmelon-native-client-clear-'));
 	await writeProject(workdir);
 
+	const restoreHome = await useTempGlobalConfig();
 	const previousCwd = process.cwd();
 	process.chdir(workdir);
 	try {
@@ -116,20 +123,40 @@ test('clearHistory forgets the active session and next run creates a new one', a
 		client.shutdown();
 	} finally {
 		process.chdir(previousCwd);
+		restoreHome();
 	}
 });
 
 async function writeProject(workdir: string) {
 	await mkdir(path.join(workdir, '.openmelon'), {recursive: true});
+	// Project file carries identity only; model / provider / key are GLOBAL now.
 	await writeFile(
 		path.join(workdir, '.openmelon', 'project.json'),
+		JSON.stringify({id: 'proj', name: 'Project'})
+	);
+}
+
+// Isolate ~/.openmelon to a throwaway dir and point the global default at a dead
+// local port so the runtime resolves a real provider (deterministic, fast
+// connection-refused) WITHOUT touching the developer's real config or API key.
+async function useTempGlobalConfig(): Promise<() => void> {
+	const home = await mkdtemp(path.join(tmpdir(), 'openmelon-home-'));
+	await writeFile(
+		path.join(home, 'config.json'),
 		JSON.stringify({
-			id: 'proj',
-			name: 'Project',
 			defaults: {llm_provider: 'openai', llm_model: 'gpt-test'},
 			providers: {openai: {api_key: 'test-key', base_url: 'http://127.0.0.1:9'}}
 		})
 	);
+	const previous = process.env.OPENMELON_HOME;
+	process.env.OPENMELON_HOME = home;
+	return () => {
+		if (previous === undefined) {
+			delete process.env.OPENMELON_HOME;
+		} else {
+			process.env.OPENMELON_HOME = previous;
+		}
+	};
 }
 
 async function listSessions(workdir: string) {

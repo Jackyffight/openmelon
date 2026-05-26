@@ -13,6 +13,7 @@ import {randomPlaceholder} from './placeholder.js';
 import {initialState, reducer} from './state/reducer.js';
 import {discoverProject} from './core/project.js';
 import {loadProject, saveProject} from './core/project.js';
+import {setGlobalDefaults} from './core/config.js';
 import {loadSessionEvents, loadSessionHistory, sessionDir, type ChatMessage} from './core/session.js';
 import {inspectBootstrap, type BootstrapState} from './core/bootstrap.js';
 import {Onboarding} from './onboarding/Onboarding.js';
@@ -1310,15 +1311,8 @@ async function applyModelDefaults(
 	refreshBootstrap: () => Promise<BootstrapState>,
 	next: {provider: ProviderOption['slug']; model: string}
 ) {
-	if (!bootstrap.workdir) {
-		dispatch({type: 'command-panel', kind: 'error', text: 'project is not ready'});
-		return;
-	}
-	const project = await loadProject(bootstrap.workdir);
-	project.defaults = project.defaults ?? {};
-	project.defaults.llm_provider = next.provider;
-	project.defaults.llm_model = next.model;
-	await saveProject(bootstrap.workdir, project);
+	// Model / provider are GLOBAL (~/.openmelon/config.json), never per-project.
+	await setGlobalDefaults({llm_provider: next.provider, llm_model: next.model});
 	await refreshBootstrap();
 	reloadRuntime();
 	dispatch({type: 'command-panel', kind: 'info', text: `(LLM: ${composeModelTag(next.provider, next.model)})`});
@@ -1331,15 +1325,8 @@ async function applyImageDefaults(
 	refreshBootstrap: () => Promise<BootstrapState>,
 	next: {provider: string; model: string}
 ) {
-	if (!bootstrap.workdir) {
-		dispatch({type: 'command-panel', kind: 'error', text: 'project is not ready'});
-		return;
-	}
-	const project = await loadProject(bootstrap.workdir);
-	project.defaults = project.defaults ?? {};
-	project.defaults.image_provider = next.model ? next.provider : '';
-	project.defaults.image_model = next.model;
-	await saveProject(bootstrap.workdir, project);
+	// Image model / provider are GLOBAL, never per-project.
+	await setGlobalDefaults({image_provider: next.model ? next.provider : '', image_model: next.model});
 	await refreshBootstrap();
 	reloadRuntime();
 	dispatch({
@@ -1378,11 +1365,11 @@ function imageProviderFor(bootstrap: BootstrapState, state: TuiState) {
 }
 
 function bootstrapProjectImageProvider(bootstrap: BootstrapState) {
-	return bootstrap.project?.defaults?.image_provider ?? '';
+	return bootstrap.imageProvider ?? '';
 }
 
 function bootstrapProjectImageModel(bootstrap: BootstrapState) {
-	return bootstrap.project?.defaults?.image_model ?? '';
+	return bootstrap.imageModel ?? '';
 }
 
 function bootstrapProjectSettings(bootstrap: BootstrapState) {

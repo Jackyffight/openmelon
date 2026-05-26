@@ -148,3 +148,92 @@ export function providerApiKeyEnv(provider: string) {
 			return 'OPENAI_API_KEY';
 	}
 }
+
+export function providerBaseUrlEnv(provider: string) {
+	switch (provider) {
+		case 'anthropic':
+			return 'ANTHROPIC_BASE_URL';
+		case 'openrouter':
+			return 'OPENROUTER_BASE_URL';
+		default:
+			return 'OPENAI_BASE_URL';
+	}
+}
+
+export type KeySource = 'global' | 'env' | 'none';
+
+// ---------------------------------------------------------------------------
+// GLOBAL config is the single source of truth for model / provider / key /
+// base_url. There is intentionally no project-level override: the project file
+// only carries identity, persona, constraints, continuity, and the per-project
+// `reasoning_effort` behaviour knob. Everything below resolves from
+// ~/.openmelon/{config,credentials}.json and env vars ONLY — never the workdir.
+// ---------------------------------------------------------------------------
+
+/** Resolve a provider's api key + base url from global config only:
+ *  config.json providers[] (base_url) → credentials.json (key) → env. */
+export async function resolveProvider(provider: string): Promise<{apiKey: string; baseURL: string}> {
+	const config = await loadUserConfig();
+	const credentials = await loadCredentials();
+	const globalProvider = config.providers?.[provider];
+	const apiKey =
+		globalProvider?.api_key || credentials.api_keys?.[provider] || process.env[providerApiKeyEnv(provider)] || '';
+	const baseURL = globalProvider?.base_url || process.env[providerBaseUrlEnv(provider)] || '';
+	return {apiKey, baseURL};
+}
+
+export async function resolveApiKey(provider: string): Promise<{key: string; source: KeySource}> {
+	const config = await loadUserConfig();
+	const credentials = await loadCredentials();
+	const globalKey = config.providers?.[provider]?.api_key || credentials.api_keys?.[provider];
+	if (globalKey) {
+		return {key: globalKey, source: 'global'};
+	}
+	const envKey = process.env[providerApiKeyEnv(provider)];
+	if (envKey) {
+		return {key: envKey, source: 'env'};
+	}
+	return {key: '', source: 'none'};
+}
+
+/** Patch the global default model / provider / image-model / reasoning. */
+export async function setGlobalDefaults(patch: Partial<NonNullable<UserConfig['defaults']>>) {
+	const config = await loadUserConfig();
+	config.defaults = {...config.defaults, ...patch};
+	await saveUserConfig(config);
+}
+
+/** Set (or, with an empty url, clear) a provider's global base_url. */
+export async function setGlobalBaseUrl(provider: string, url: string) {
+	const config = await loadUserConfig();
+	const providers = {...config.providers};
+	const entry = {...providers[provider]};
+	if (url) {
+		entry.base_url = url;
+	} else {
+		delete entry.base_url;
+	}
+	if (Object.keys(entry).length === 0) {
+		delete providers[provider];
+	} else {
+		providers[provider] = entry;
+	}
+	config.providers = providers;
+	await saveUserConfig(config);
+}
+
+export async function setGlobalApiKey(provider: string, key: string) {
+	const credentials = await loadCredentials();
+	credentials.api_keys = {...credentials.api_keys, [provider]: key};
+	await saveCredentials(credentials);
+}
+
+export async function unsetGlobalApiKey(provider: string): Promise<boolean> {
+	const credentials = await loadCredentials();
+	if (!credentials.api_keys?.[provider]) {
+		return false;
+	}
+	delete credentials.api_keys[provider];
+	await saveCredentials(credentials);
+	return true;
+}

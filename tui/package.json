@@ -1,19 +1,43 @@
 {
-  "name": "@e8s/openmelon-tui",
-  "version": "0.1.0",
-  "private": true,
+  "name": "@e8s/openmelon",
+  "version": "0.4.0",
+  "description": "A content-creation agent that runs in your terminal. Pure TypeScript.",
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/eight-acres-lab/openmelon",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/eight-acres-lab/openmelon.git",
+    "directory": "tui"
+  },
+  "bugs": {
+    "url": "https://github.com/eight-acres-lab/openmelon/issues"
+  },
+  "keywords": [
+    "openmelon",
+    "ai-agent",
+    "content-generation",
+    "multimodal",
+    "skillplus",
+    "cli"
+  ],
   "type": "module",
   "bin": {
     "openmelon": "bin/openmelon.js"
   },
+  "files": [
+    "dist",
+    "bin"
+  ],
   "scripts": {
     "dev": "tsx src/cli.ts",
     "check": "tsc --noEmit",
     "test": "npm run build && node --test dist/**/*.test.js",
     "build": "tsc -p tsconfig.build.json",
-    "start": "node dist/cli.js"
+    "start": "node dist/cli.js",
+    "prepublishOnly": "npm run build"
   },
   "dependencies": {
+    "@e8s/vbox-cli": "^0.4.1",
     "ansi-regex": "^6.2.2",
     "ink": "^5.2.1",
     "marked": "^18.0.4",
@@ -26,5 +50,8 @@
     "@types/react": "^18.3.20",
     "tsx": "^4.20.0",
     "typescript": "^5.8.0"
+  },
+  "engines": {
+    "node": ">=20"
   }
 }

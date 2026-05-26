@@ -1,7 +1,16 @@
-import {loadCredentials, loadProjects, loadUserConfig, markProjectUsed, providerApiKeyEnv, saveUserConfig} from '../core/config.js';
-import {loadProject, saveProject, type ProjectConfig} from '../core/project.js';
+import {
+	loadProjects,
+	loadUserConfig,
+	markProjectUsed,
+	providerApiKeyEnv,
+	resolveApiKey,
+	saveUserConfig,
+	setGlobalApiKey,
+	setGlobalBaseUrl,
+	unsetGlobalApiKey
+} from '../core/config.js';
 import {providers} from '../core/providers.js';
-import {formatTable, maskKey, parseArgs, projectCredentialsPath, readJsonMaybe, resolveProjectWorkdir, stringFlag, writeJson} from './common.js';
+import {formatTable, maskKey, parseArgs, resolveProjectWorkdir, stringFlag} from './common.js';
 
 export async function runProjectCommand(args: string[]) {
 	const [subcommand, ...rest] = args;
@@ -64,23 +73,25 @@ async function projectShow(args: string[]) {
 			console.log(`  - ${item}`);
 		}
 	}
-	if (project.defaults && Object.keys(project.defaults).length > 0) {
-		console.log('Defaults:');
-		for (const [key, value] of Object.entries(project.defaults)) {
+	// Model / provider / image defaults are GLOBAL, not per-project.
+	const config = await loadUserConfig();
+	if (config.defaults && Object.keys(config.defaults).length > 0) {
+		console.log('Defaults (global):');
+		for (const [key, value] of Object.entries(config.defaults)) {
 			if (value) {
 				console.log(`  ${key}: ${value}`);
 			}
 		}
 	}
 	if (project.settings && Object.keys(project.settings).length > 0) {
-		console.log('Settings:');
+		console.log('Settings (project):');
 		for (const [key, value] of Object.entries(project.settings)) {
 			if (value) {
 				console.log(`  ${key}: ${value}`);
 			}
 		}
 	}
-	await printKeySources(workdir, project);
+	await printKeySources();
 }
 
 async function projectSetKey(args: string[]) {
@@ -91,73 +102,41 @@ async function projectSetKey(args: string[]) {
 	}
 	const key = stringFlag(parsed, 'api-key') || stringFlag(parsed, 'key') || process.env[providerApiKeyEnv(provider)] || '';
 	if (!key) {
-		throw new Error(`project set-key: pass --api-key or set ${providerApiKeyEnv(provider)}`);
+		throw new Error(`set-key: pass --api-key or set ${providerApiKeyEnv(provider)}`);
 	}
-	const {workdir} = await resolveProjectWorkdir();
-	const credentials = await readJsonMaybe<{api_keys?: Record<string, string>}>(projectCredentialsPath(workdir), {api_keys: {}});
-	credentials.api_keys = {...credentials.api_keys, [provider]: key};
-	await writeJson(projectCredentialsPath(workdir), credentials, 0o600);
+	// Keys / base_url live in GLOBAL config — there is no project-scoped store.
+	await setGlobalApiKey(provider, key);
 	const baseURL = stringFlag(parsed, 'base-url');
 	if (baseURL) {
-		const project = await loadProject(workdir);
-		project.providers = {...project.providers, [provider]: {...project.providers?.[provider], base_url: baseURL}};
-		await saveProject(workdir, project);
+		await setGlobalBaseUrl(provider, baseURL);
 	}
-	console.log(`Saved project key for ${provider}.`);
+	console.log(`Saved global key for ${provider}.`);
 }
 
 async function projectUnsetKey(args: string[]) {
 	if (args.length !== 1) {
 		throw new Error('usage: openmelon project unset-key <provider>');
 	}
-	const {workdir} = await resolveProjectWorkdir();
-	const credentials = await readJsonMaybe<{api_keys?: Record<string, string>}>(projectCredentialsPath(workdir), {api_keys: {}});
-	if (!credentials.api_keys?.[args[0]!]) {
-		console.log(`No project-scoped key set for ${args[0]} (nothing to remove).`);
-		return;
-	}
-	delete credentials.api_keys[args[0]!];
-	await writeJson(projectCredentialsPath(workdir), credentials, 0o600);
-	console.log(`Removed project key for ${args[0]}.`);
+	const removed = await unsetGlobalApiKey(args[0]!);
+	console.log(removed ? `Removed global key for ${args[0]}.` : `No key set for ${args[0]} (nothing to remove).`);
 }
 
 async function projectKeys() {
-	const {workdir, project} = await resolveProjectWorkdir();
-	await printKeySources(workdir, project, true);
+	await printKeySources(true);
 }
 
-async function printKeySources(workdir: string, project: ProjectConfig, includeMissing = false) {
+async function printKeySources(includeMissing = false) {
 	const config = await loadUserConfig();
-	const credentials = await loadCredentials();
-	const projectCredentials = await readJsonMaybe<{api_keys?: Record<string, string>}>(projectCredentialsPath(workdir), {api_keys: {}});
 	const rows: string[][] = [];
 	for (const provider of providers.map(item => item.slug)) {
-		const projectProvider = project.providers?.[provider];
-		const globalProvider = config.providers?.[provider];
-		let source = '';
-		let key = '';
-		if (projectProvider?.api_key) {
-			source = 'project';
-			key = projectProvider.api_key;
-		} else if (projectCredentials.api_keys?.[provider]) {
-			source = 'project';
-			key = projectCredentials.api_keys[provider]!;
-		} else if (globalProvider?.api_key) {
-			source = 'global';
-			key = globalProvider.api_key;
-		} else if (credentials.api_keys?.[provider]) {
-			source = 'global';
-			key = credentials.api_keys[provider]!;
-		} else if (process.env[providerApiKeyEnv(provider)]) {
-			source = 'env';
-			key = process.env[providerApiKeyEnv(provider)]!;
-		}
+		const {key, source} = await resolveApiKey(provider);
+		const baseURL = config.providers?.[provider]?.base_url || '';
 		if (key || includeMissing) {
-			rows.push([provider, source || '(none)', key ? maskKey(key) : '']);
+			rows.push([provider, source === 'none' ? '(none)' : source, key ? maskKey(key) : '', baseURL]);
 		}
 	}
 	if (rows.length > 0) {
-		console.log('Credentials:');
-		console.log(formatTable(['PROVIDER', 'SOURCE', 'VALUE'], rows));
+		console.log('Credentials (global):');
+		console.log(formatTable(['PROVIDER', 'SOURCE', 'KEY', 'BASE_URL'], rows));
 	}
 }

@@ -706,6 +706,8 @@ const emptyBootstrap: BootstrapState = {
 	model: '',
 	reasoning: '',
 	provider: 'openrouter',
+	imageModel: '',
+	imageProvider: '',
 	project: undefined,
 	ready: false,
 	issues: [],
