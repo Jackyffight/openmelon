@@ -1,7 +1,7 @@
 import {promises as fs} from 'node:fs';
 import path from 'node:path';
 import {openmelonHome, readJsonFile, writeJsonFile} from './fs.js';
-import {loadProject, stateDir, type ProjectDefaults, type ProviderConfig} from './project.js';
+import type {ProjectDefaults, ProviderConfig} from './project.js';
 
 export type UserConfig = {
 	current_project?: string;
@@ -114,7 +114,7 @@ export function providerApiKeyEnv(provider: string) {
 	}
 }
 
-function providerBaseUrlEnv(provider: string) {
+export function providerBaseUrlEnv(provider: string) {
 	switch (provider) {
 		case 'anthropic':
 			return 'ANTHROPIC_BASE_URL';
@@ -125,108 +125,91 @@ function providerBaseUrlEnv(provider: string) {
 	}
 }
 
-// --- project-scoped credentials (<workdir>/.openmelon/credentials.json) ---
-
-function projectCredentialsPath(workdir: string) {
-	return path.join(stateDir(workdir), 'credentials.json');
-}
-
-export async function loadProjectCredentials(workdir: string): Promise<Credentials> {
-	return readJsonFile<Credentials>(projectCredentialsPath(workdir), {api_keys: {}});
-}
-
-export async function saveProjectCredentials(workdir: string, credentials: Credentials) {
-	await writeJsonFile(projectCredentialsPath(workdir), {api_keys: credentials.api_keys ?? {}}, 0o600);
-}
-
-export async function setProjectApiKey(workdir: string, provider: string, key: string) {
-	const creds = await loadProjectCredentials(workdir);
-	creds.api_keys = {...(creds.api_keys ?? {}), [provider]: key};
-	await saveProjectCredentials(workdir, creds);
-}
-
-/** Remove a provider's project-scoped key. Returns true if one was removed. */
-export async function unsetProjectApiKey(workdir: string, provider: string): Promise<boolean> {
-	const creds = await loadProjectCredentials(workdir);
-	if (!creds.api_keys?.[provider]) {
-		return false;
-	}
-	delete creds.api_keys[provider];
-	await saveProjectCredentials(workdir, creds);
-	return true;
-}
-
-export type KeySource = 'project' | 'global' | 'none';
+export type KeySource = 'global' | 'env' | 'none';
 
 /**
- * Resolve a provider's API key with project-overrides-global semantics
- * (project credentials.json → global credentials.json). Env vars are NOT
- * consulted here (the factories apply that fallback). Mirrors Go ResolveAPIKey.
+ * Resolve a provider's API key from global config/credentials/env only.
+ * Accepts the old `(workdir, provider)` call shape for compatibility, but
+ * intentionally ignores workdir: provider connection settings are global.
  */
-export async function resolveApiKey(workdir: string, provider: string): Promise<{key: string; source: KeySource}> {
-	if (workdir) {
-		const projectKey = (await loadProjectCredentials(workdir)).api_keys?.[provider];
-		if (projectKey) {
-			return {key: projectKey, source: 'project'};
-		}
-	}
-	const globalKey = (await loadCredentials()).api_keys?.[provider];
+export async function resolveApiKey(providerOrWorkdir: string, maybeProvider?: string): Promise<{key: string; source: KeySource}> {
+	const provider = maybeProvider ?? providerOrWorkdir;
+	const config = await loadUserConfig();
+	const globalKey = config.providers?.[provider]?.api_key || (await loadCredentials()).api_keys?.[provider];
 	if (globalKey) {
 		return {key: globalKey, source: 'global'};
+	}
+	const envKey = process.env[providerApiKeyEnv(provider)];
+	if (envKey) {
+		return {key: envKey, source: 'env'};
 	}
 	return {key: '', source: 'none'};
 }
 
 /**
- * Resolve a provider's effective {apiKey, baseURL, keySource}. Precedence:
- * project.json providers → global config providers → project/global
- * credentials.json → env. Mirrors Go userconfig.ResolveProvider.
+ * Resolve a provider's effective {apiKey, baseURL, keySource} from global
+ * config/credentials/env only. Accepts `(workdir, provider)` for old callers.
  */
-export async function resolveProvider(workdir: string, provider: string): Promise<{apiKey: string; baseURL: string; keySource: string}> {
-	let apiKey = '';
-	let baseURL = '';
-	let keySource = '';
-
-	if (workdir) {
-		const project = await loadProject(workdir);
-		const pc = project.providers?.[provider];
-		if (pc?.api_key) {
-			apiKey = pc.api_key;
-			keySource = 'project.config';
-		}
-		if (pc?.base_url) {
-			baseURL = pc.base_url;
-		}
-	}
-
+export async function resolveProvider(providerOrWorkdir: string, maybeProvider?: string): Promise<{apiKey: string; baseURL: string; keySource: string}> {
+	const provider = maybeProvider ?? providerOrWorkdir;
 	const config = await loadUserConfig();
 	const gpc = config.providers?.[provider];
-	if (!apiKey && gpc?.api_key) {
+	let apiKey = '';
+	let keySource = '';
+	if (gpc?.api_key) {
 		apiKey = gpc.api_key;
 		keySource = 'global.config';
 	}
-	if (!baseURL && gpc?.base_url) {
-		baseURL = gpc.base_url;
-	}
-
 	if (!apiKey) {
-		const {key, source} = await resolveApiKey(workdir, provider);
+		const {key, source} = await resolveApiKey(provider);
 		if (key) {
 			apiKey = key;
-			keySource = `${source}.credentials`;
+			keySource = source === 'env' ? 'env' : `${source}.credentials`;
 		}
 	}
-	if (!apiKey) {
-		const envKey = process.env[providerApiKeyEnv(provider)];
-		if (envKey) {
-			apiKey = envKey;
-			keySource = 'env';
-		}
-	}
-	if (!baseURL) {
-		baseURL = process.env[providerBaseUrlEnv(provider)] ?? '';
-	}
+	const baseURL = gpc?.base_url || process.env[providerBaseUrlEnv(provider)] || '';
 	return {apiKey, baseURL, keySource};
+}
+
+/** Patch global default model/provider/image/reasoning settings. */
+export async function setGlobalDefaults(patch: Partial<NonNullable<UserConfig['defaults']>>) {
+	const config = await loadUserConfig();
+	config.defaults = {...config.defaults, ...patch};
+	await saveUserConfig(config);
+}
+
+export async function setGlobalBaseUrl(provider: string, url: string) {
+	const config = await loadUserConfig();
+	const providers = {...config.providers};
+	const entry = {...providers[provider]};
+	if (url) {
+		entry.base_url = url;
+	} else {
+		delete entry.base_url;
+	}
+	if (Object.keys(entry).length === 0) {
+		delete providers[provider];
+	} else {
+		providers[provider] = entry;
+	}
+	config.providers = providers;
+	await saveUserConfig(config);
+}
+
+export async function setGlobalApiKey(provider: string, key: string) {
+	const credentials = await loadCredentials();
+	credentials.api_keys = {...(credentials.api_keys ?? {}), [provider]: key};
+	await saveCredentials(credentials);
+}
+
+export async function unsetGlobalApiKey(provider: string): Promise<boolean> {
+	const credentials = await loadCredentials();
+	if (!credentials.api_keys?.[provider]) {
+		return false;
+	}
+	delete credentials.api_keys[provider];
+	await saveCredentials(credentials);
+	return true;
 }
 
 // --- project registry (~/.openmelon/projects.json) ---

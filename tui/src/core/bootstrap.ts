@@ -1,5 +1,5 @@
 import {discoverProject, loadProject, type ProjectConfig} from './project.js';
-import {isTrusted, loadCredentials, loadUserConfig, providerApiKeyEnv} from './config.js';
+import {isTrusted, loadUserConfig, resolveApiKey} from './config.js';
 
 export type BootstrapState = {
 	cwd: string;
@@ -9,6 +9,8 @@ export type BootstrapState = {
 	model: string;
 	reasoning: string;
 	provider: string;
+	imageModel: string;
+	imageProvider: string;
 	project?: ProjectConfig;
 	ready: boolean;
 	issues: string[];
@@ -21,19 +23,21 @@ export async function inspectBootstrap(): Promise<BootstrapState> {
 	const cwd = process.cwd();
 	const workdir = await discoverProject();
 	const config = await loadUserConfig();
-	const credentials = await loadCredentials();
 	const issues: string[] = [];
-	const globallyConfiguredKey = Object.keys(credentials.api_keys ?? {}).length > 0;
+	const provider = config.defaults?.llm_provider || 'openai';
+	const model = config.defaults?.llm_model || 'gpt-5.5';
+	const imageProvider = config.defaults?.image_provider || '';
+	const imageModel = config.defaults?.image_model || '';
+	const {key: resolvedKey} = await resolveApiKey(provider);
+	const hasKey = Boolean(resolvedKey);
 
 	if (!workdir) {
 		const needsTrust = !isTrusted(config, cwd);
-		const provider = config.defaults?.llm_provider || 'openrouter';
-		const model = config.defaults?.llm_model || 'openai/gpt-5.5';
 		const reasoning = config.defaults?.reasoning_effort || 'xhigh';
 		if (needsTrust) {
 			issues.push(`trust ${cwd} before OpenMelon reads project files`);
 		}
-		if (!globallyConfiguredKey) {
+		if (!hasKey) {
 			issues.push('no API key configured');
 		}
 		issues.push('no openmelon project found');
@@ -45,12 +49,14 @@ export async function inspectBootstrap(): Promise<BootstrapState> {
 			model,
 			reasoning,
 			provider,
+			imageModel,
+			imageProvider,
 			project: undefined,
 			ready: false,
 			issues,
 			needsTrust,
 			needsProject: true,
-			needsKey: !globallyConfiguredKey
+			needsKey: !hasKey
 		};
 	}
 
@@ -61,20 +67,10 @@ export async function inspectBootstrap(): Promise<BootstrapState> {
 		issues.push(`trust ${cwd} before OpenMelon reads project files`);
 	}
 
-	const provider = project.defaults?.llm_provider || config.defaults?.llm_provider || 'openai';
-	const model = project.defaults?.llm_model || config.defaults?.llm_model || 'gpt-5.5';
 	const reasoning = project.settings?.reasoning_effort || config.defaults?.reasoning_effort || 'xhigh';
-	const projectProvider = project.providers?.[provider];
-	const globalProvider = config.providers?.[provider];
-	const hasKey =
-		globallyConfiguredKey ||
-		Boolean(projectProvider?.api_key) ||
-		Boolean(globalProvider?.api_key) ||
-		Boolean(credentials.api_keys?.[provider]) ||
-		Boolean(process.env[providerApiKeyEnv(provider)]);
 
 	if (!hasKey && provider !== 'auto') {
-		issues.push(`no API key for ${provider} - run \`openmelon setup\` or configure ${providerApiKeyEnv(provider)}`);
+		issues.push(`no API key for ${provider} - run \`openmelon setup\` or configure the provider's API key env var`);
 	}
 
 	return {
@@ -85,6 +81,8 @@ export async function inspectBootstrap(): Promise<BootstrapState> {
 		model,
 		reasoning,
 		provider,
+		imageModel,
+		imageProvider,
 		project,
 		ready: issues.length === 0,
 		issues,

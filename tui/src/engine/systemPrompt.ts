@@ -90,6 +90,16 @@ export function buildProjectSystemPrompt(project: ProjectConfig, toolNames: stri
 			'\nWork like a senior creator. Before producing visual work, load known characters, scenes, and style references via list_characters / get_character / list_references / get_reference / search, and pass their image paths as reference_images to anchor continuity. Generate visual outputs through `generate_image` with relevant reference_images and explicit prompt constraints (characters, scene, typography, layout, style). Treat typography as a descriptive prompt constraint, not a local font lookup. Save user-facing deliverables in visible project output directories such as `outputs/`; `.openmelon` is reserved for internal state. Use save_artifact to promote a final image. When done, call `finish` with a short summary and the final artifact paths.'
 		);
 	}
+	if (toolNames.includes('web_search') || toolNames.includes('web_fetch')) {
+		lines.push(
+			'Use `web_search` for recent or external facts and `web_fetch` when a result needs closer inspection. Cite source URLs in user-facing answers when web tools influence the answer.'
+		);
+	}
+	if (toolNames.includes('bash')) {
+		lines.push(
+			'Publishing to V-Box: V-Box is the global creative community for AI-made content. When the user is happy with a result and wants to publish or share it, use the bundled V-Box publishing flow only after the user agrees. Posts go to the owner review queue and are not public until the owner approves them.'
+		);
+	}
 	lines.push(`\nAvailable tools: ${toolNames.join(', ')}`);
 	return lines.join('\n') + '\n';
 }

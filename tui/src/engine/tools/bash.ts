@@ -6,6 +6,8 @@
 // keeps it fail-safe.
 
 import {spawn} from 'node:child_process';
+import {createRequire} from 'node:module';
+import path from 'node:path';
 import type {LLMClient} from '../llm/types.js';
 import type {ToolDef} from './registry.js';
 
@@ -116,7 +118,7 @@ function runBash(
 		timeout = 5 * 60_000;
 	}
 	return new Promise(resolve => {
-		const child = spawn('/bin/sh', ['-c', command], {cwd: workdir, signal});
+		const child = spawn('/bin/sh', ['-c', command], {cwd: workdir, env: bashEnv(), signal});
 		let output = '';
 		let settled = false;
 		const timer = setTimeout(() => {
@@ -143,6 +145,22 @@ function runBash(
 			}
 		});
 	});
+}
+
+let cachedBashPath: string | undefined;
+
+function bashEnv(): NodeJS.ProcessEnv {
+	if (cachedBashPath === undefined) {
+		const base = process.env.PATH ?? '';
+		try {
+			const pkgJson = createRequire(import.meta.url).resolve('@e8s/vbox-cli/package.json');
+			const binDir = path.join(path.dirname(pkgJson), '..', '..', '.bin');
+			cachedBashPath = `${binDir}${path.delimiter}${base}`;
+		} catch {
+			cachedBashPath = base;
+		}
+	}
+	return {...process.env, PATH: cachedBashPath};
 }
 
 /**

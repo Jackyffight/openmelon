@@ -17,6 +17,7 @@ import {randomPlaceholder} from './placeholder.js';
 import {initialState, reducer} from './state/reducer.js';
 import {discoverProject} from './core/project.js';
 import {loadProject, saveProject} from './core/project.js';
+import {setGlobalDefaults} from './core/config.js';
 import {loadSessionEvents, loadSessionHistory, sessionDir, type ChatMessage} from './core/session.js';
 import {inspectBootstrap, type BootstrapState} from './core/bootstrap.js';
 import {Onboarding} from './onboarding/Onboarding.js';
@@ -925,7 +926,7 @@ function overlayView(overlay: Overlay, bootstrap: BootstrapState, state: TuiStat
 	}
 	if (overlay.kind === 'approval') {
 		return {
-			title: `Do you want to run ${overlay.tool}?`,
+			title: `Do you want to run ${approvalToolLabel(overlay.tool)}?`,
 			description: [overlay.description, overlay.command].filter(Boolean).join('\n\n'),
 			rows: approvalRows(overlay),
 			active: overlay.cursor,
@@ -1052,9 +1053,29 @@ function commitSkillRow(row: OverlayRow, dispatch: Dispatch) {
 function approvalRows(overlay: Extract<Overlay, {kind: 'approval'}>): OverlayRow[] {
 	return [
 		{id: 'yes', value: 'yes', title: 'Yes'},
-		{id: 'always', value: 'always', title: `Yes, always allow \`${overlay.binary || 'this binary'}\` this session`},
+		{id: 'always', value: 'always', title: `Yes, always allow ${approvalScopeLabel(overlay)} this session`},
 		{id: 'no', value: 'no', title: 'No'}
 	];
+}
+
+function approvalToolLabel(tool: string) {
+	if (tool === 'web_search') {
+		return 'Web search';
+	}
+	if (tool === 'web_fetch') {
+		return 'Web fetch';
+	}
+	return tool === 'bash' ? 'Bash' : tool;
+}
+
+function approvalScopeLabel(overlay: Extract<Overlay, {kind: 'approval'}>) {
+	if (overlay.tool === 'web_search') {
+		return 'web searches through DuckDuckGo';
+	}
+	if (overlay.tool === 'web_fetch') {
+		return `fetching ${overlay.binary || 'this host'}`;
+	}
+	return `\`${overlay.binary || 'this binary'}\``;
 }
 
 function answerApproval(bridge: RuntimeBridge | null, overlay: Extract<Overlay, {kind: 'approval'}>, index: number) {
@@ -1152,11 +1173,7 @@ async function applyModelDefaults(
 		dispatch({type: 'append', kind: 'error', text: 'project is not ready'});
 		return;
 	}
-	const project = await loadProject(bootstrap.workdir);
-	project.defaults = project.defaults ?? {};
-	project.defaults.llm_provider = next.provider;
-	project.defaults.llm_model = next.model;
-	await saveProject(bootstrap.workdir, project);
+	await setGlobalDefaults({llm_provider: next.provider, llm_model: next.model});
 	await refreshBootstrap();
 	reloadRuntime();
 	dispatch({type: 'append', kind: 'info', text: `(LLM: ${composeModelTag(next.provider, next.model)})`});
@@ -1173,11 +1190,7 @@ async function applyImageDefaults(
 		dispatch({type: 'append', kind: 'error', text: 'project is not ready'});
 		return;
 	}
-	const project = await loadProject(bootstrap.workdir);
-	project.defaults = project.defaults ?? {};
-	project.defaults.image_provider = next.model ? next.provider : '';
-	project.defaults.image_model = next.model;
-	await saveProject(bootstrap.workdir, project);
+	await setGlobalDefaults({image_provider: next.model ? next.provider : '', image_model: next.model});
 	await refreshBootstrap();
 	reloadRuntime();
 	dispatch({
@@ -1216,11 +1229,11 @@ function imageProviderFor(bootstrap: BootstrapState, state: TuiState) {
 }
 
 function bootstrapProjectImageProvider(bootstrap: BootstrapState) {
-	return bootstrap.project?.defaults?.image_provider ?? '';
+	return bootstrap.imageProvider || bootstrap.project?.defaults?.image_provider || '';
 }
 
 function bootstrapProjectImageModel(bootstrap: BootstrapState) {
-	return bootstrap.project?.defaults?.image_model ?? '';
+	return bootstrap.imageModel || bootstrap.project?.defaults?.image_model || '';
 }
 
 function bootstrapProjectSettings(bootstrap: BootstrapState) {

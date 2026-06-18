@@ -16,7 +16,7 @@ import {Runtime, type Tracer} from './runtime.js';
 import {newLLM} from './llm/factory.js';
 import {newImageGenerator, type ImageGenerator} from './imagegen.js';
 import {buildRegistry} from './tools/builtin.js';
-import {judgeBashWithLLM, type ApprovalDecision, type BashMode} from './tools/bash.js';
+import {judgeBashWithLLM, type ApprovalDecision, type ApprovalRequest, type BashMode} from './tools/bash.js';
 import {buildProjectSystemPrompt, resolveDefaults, resolveReasoningEffort} from './systemPrompt.js';
 import type {Message, ToolCall} from './llm/types.js';
 
@@ -55,7 +55,8 @@ class LocalEngine {
 	private pending: string[] = [];
 	private controller: AbortController | undefined;
 	private readonly allowedBins = new Set<string>();
-	private readonly approvals = new Map<string, (decision: ApprovalDecision) => void>();
+	private readonly allowedApprovalScopes = new Set<string>();
+	private readonly approvals = new Map<string, {req: ApprovalRequest; settle: (decision: ApprovalDecision) => void}>();
 	private approvalSeq = 0;
 
 	constructor(
@@ -81,13 +82,13 @@ class LocalEngine {
 			const llmProvider = defaults.llmProvider || 'auto';
 			const imageProvider = defaults.imageProvider || 'openrouter';
 
-			const llmCreds = llmProvider === 'auto' ? {apiKey: '', baseURL: ''} : await resolveProvider(workdir, llmProvider);
+			const llmCreds = llmProvider === 'auto' ? {apiKey: '', baseURL: ''} : await resolveProvider(llmProvider);
 			const llm = newLLM(llmProvider, llmCreds.apiKey, llmCreds.baseURL, defaults.llmModel);
 
 			let imageGen: ImageGenerator | undefined;
 			if (defaults.imageModel) {
 				try {
-					const imgCreds = await resolveProvider(workdir, imageProvider);
+					const imgCreds = await resolveProvider(imageProvider);
 					imageGen = newImageGenerator(imageProvider, imgCreds.apiKey, imgCreds.baseURL, defaults.imageModel);
 				} catch (error) {
 					this.emit({type: 'append', kind: 'error', text: `image generation disabled: ${(error as Error).message}`});
@@ -244,8 +245,12 @@ class LocalEngine {
 		return drained.length > 0 ? drained.join('\n\n') : '';
 	}
 
-	/** Emit an approval request and resolve when the TUI answers (or after 10 min → denied). */
-	private requestApproval(req: {tool: string; command: string; description: string; binary: string}): Promise<ApprovalDecision> {
+	/** Emit an approval request and resolve when the TUI answers (or after 10 min -> denied). */
+	private requestApproval(req: ApprovalRequest): Promise<ApprovalDecision> {
+		const scope = approvalScopeKey(req);
+		if (scope && this.allowedApprovalScopes.has(scope)) {
+			return Promise.resolve({approved: true, always: true});
+		}
 		this.approvalSeq += 1;
 		const id = `approval-${this.approvalSeq}`;
 		return new Promise<ApprovalDecision>(resolve => {
@@ -255,10 +260,13 @@ class LocalEngine {
 					return;
 				}
 				done = true;
+				if (decision.approved && decision.always && scope) {
+					this.allowedApprovalScopes.add(scope);
+				}
 				this.approvals.delete(id);
 				resolve(decision);
 			};
-			this.approvals.set(id, settle);
+			this.approvals.set(id, {req, settle});
 			this.emit({
 				type: 'approval',
 				activity: `Approve ${req.tool}`,
@@ -270,7 +278,7 @@ class LocalEngine {
 
 	/** Called by the TUI when the user answers an approval modal. */
 	answerApproval(id: string, approved: boolean, always: boolean): void {
-		this.approvals.get(id)?.({approved, always});
+		this.approvals.get(id)?.settle({approved, always});
 	}
 
 	cancel(): void {
@@ -327,6 +335,16 @@ class LocalEngine {
 		this.cancel();
 		this.closed = true;
 	}
+}
+
+function approvalScopeKey(req: ApprovalRequest): string {
+	if (req.tool === 'web_search') {
+		return 'web_search:duckduckgo.com';
+	}
+	if (req.tool === 'web_fetch') {
+		return `web_fetch:${req.binary || 'web'}`;
+	}
+	return '';
 }
 
 // --- engine.Message ↔ on-disk ChatMessage (snake_case, raw-JSON args) ---

@@ -10,7 +10,6 @@ import {parse as parseQuery, run as runQuery} from '../engine/search.js';
 import {loadSessionEvents} from '../core/session.js';
 import * as cont from '../engine/continuity.js';
 import {
-	loadCredentials,
 	loadProjects,
 	loadUserConfig,
 	lookup,
@@ -19,10 +18,10 @@ import {
 	NoCurrentProjectError,
 	resolveApiKey,
 	resolveProvider,
-	saveCredentials,
 	setCurrent,
-	setProjectApiKey,
-	unsetProjectApiKey
+	setGlobalApiKey,
+	setGlobalBaseUrl,
+	unsetGlobalApiKey
 } from '../core/config.js';
 
 /** Subcommands handled in TS. Others fall back to the Go binary in cli.ts. */
@@ -420,7 +419,8 @@ async function projectShow(): Promise<void> {
 			console.log(`  - ${c}`);
 		}
 	}
-	const d = p.defaults ?? {};
+	const cfg = await loadUserConfig();
+	const d = cfg.defaults ?? {};
 	const dEntries = Object.entries({
 		'llm_provider:   ': d.llm_provider,
 		'llm_model:      ': d.llm_model,
@@ -429,7 +429,7 @@ async function projectShow(): Promise<void> {
 		'locale:         ': d.locale
 	}).filter(([, v]) => v);
 	if (dEntries.length > 0) {
-		console.log('Defaults:');
+		console.log('Defaults (global):');
 		for (const [label, v] of dEntries) {
 			console.log(`  ${label}${v}`);
 		}
@@ -444,63 +444,48 @@ async function projectShow(): Promise<void> {
 			console.log(`  reasoning_effort:    ${s.reasoning_effort}`);
 		}
 	}
-	await printKeySources(wd);
+	await printKeySources();
 }
 
-async function printKeySources(wd: string): Promise<void> {
+async function printKeySources(includeMissing = false): Promise<void> {
+	const config = await loadUserConfig();
 	const rows: string[][] = [];
 	for (const provider of keyProviders) {
-		const resolved = await resolveProvider(wd, provider);
-		if (resolved.apiKey) {
-			rows.push([`${provider}:`, resolved.keySource || 'unknown', maskKey(resolved.apiKey)]);
+		const resolved = await resolveProvider(provider);
+		const baseURL = config.providers?.[provider]?.base_url || '';
+		if (resolved.apiKey || includeMissing) {
+			rows.push([`${provider}:`, resolved.keySource || 'none', resolved.apiKey ? maskKey(resolved.apiKey) : '', baseURL]);
 		}
 	}
 	if (rows.length === 0) {
 		return;
 	}
-	console.log('Credentials:');
-	for (const [prov, src, val] of rows) {
-		console.log(`  ${prov.padEnd(11)} ${src}  (${val})`);
+	console.log('Credentials (global):');
+	for (const [prov, src, val, baseURL] of rows) {
+		console.log(`  ${prov.padEnd(11)} ${src}  ${val ? `(${val})` : '(none)'}${baseURL ? `  base_url=${baseURL}` : ''}`);
 	}
 }
 
 async function projectKeys(): Promise<void> {
-	const wd = await resolveProjectWorkdir();
-	let any = false;
-	for (const provider of keyProviders) {
-		const {key, source} = await resolveApiKey(wd, provider);
-		if (source === 'none') {
-			console.log(`  ${(provider + ':').padEnd(11)} (none)`);
-			continue;
-		}
-		any = true;
-		console.log(`  ${(provider + ':').padEnd(11)} ${source}  (${maskKey(key)})`);
-	}
-	if (!any) {
-		console.error('No API keys configured. Run `openmelon setup` (global) or `openmelon project set-key` (project-scoped).');
-	}
+	await printKeySources(true);
 }
 
 async function projectSetKey(args: string[]): Promise<void> {
-	const p = parseFlags(args, {bool: ['global'], repeatable: [], valued: ['key']});
+	const p = parseFlags(args, {bool: [], repeatable: [], valued: ['key', 'api-key', 'base-url']});
 	const provider = p.positionals[0];
-	const key = p.value('key');
+	const key = p.value('api-key') || p.value('key');
 	if (!provider || !key) {
 		throw new Error(
-			'usage: openmelon project set-key <provider> --key <value> [--global]\n' +
-				'  (the interactive key wizard is not yet ported to TS; pass --key explicitly for now)'
+			'usage: openmelon project set-key <provider> --key <value> [--base-url <url>]\n' +
+					'  (the interactive key wizard is not yet ported to TS; pass --key explicitly for now)'
 		);
 	}
-	const wd = await resolveProjectWorkdir();
-	if (p.bool('global')) {
-		const creds = await loadCredentials();
-		creds.api_keys = {...(creds.api_keys ?? {}), [provider]: key};
-		await saveCredentials(creds);
-		console.log(`Set global key for ${provider}.`);
-	} else {
-		await setProjectApiKey(wd, provider, key);
-		console.log(`Set project key for ${provider}.`);
+	await setGlobalApiKey(provider, key);
+	const baseURL = p.value('base-url');
+	if (baseURL) {
+		await setGlobalBaseUrl(provider, baseURL);
 	}
+	console.log(`Set global key for ${provider}.`);
 }
 
 async function projectUnsetKey(args: string[]): Promise<void> {
@@ -508,9 +493,8 @@ async function projectUnsetKey(args: string[]): Promise<void> {
 	if (!provider || args.length !== 1) {
 		throw new Error('usage: openmelon project unset-key <provider>');
 	}
-	const wd = await resolveProjectWorkdir();
-	const removed = await unsetProjectApiKey(wd, provider);
-	console.log(removed ? `Removed project key for ${provider}.` : `No project-scoped key set for ${provider} (nothing to remove).`);
+	const removed = await unsetGlobalApiKey(provider);
+	console.log(removed ? `Removed global key for ${provider}.` : `No global key set for ${provider} (nothing to remove).`);
 }
 
 async function workdir(): Promise<string> {

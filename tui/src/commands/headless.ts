@@ -86,12 +86,12 @@ export async function runHeadless(opts: HeadlessOptions): Promise<void> {
 	const imageProvider = defaults.imageProvider || 'openrouter';
 	const imageModel = opts.imageModel || defaults.imageModel;
 
-	const llmCreds = llmProvider === 'auto' ? {apiKey: '', baseURL: ''} : await resolveProvider(workdir, llmProvider);
+	const llmCreds = llmProvider === 'auto' ? {apiKey: '', baseURL: ''} : await resolveProvider(llmProvider);
 	const llm = newLLM(llmProvider, llmCreds.apiKey, llmCreds.baseURL, llmModel);
 
 	let imageGen: ImageGenerator | undefined;
 	if (opts.imageEnabled && imageModel) {
-		const imgCreds = await resolveProvider(workdir, imageProvider);
+		const imgCreds = await resolveProvider(imageProvider);
 		imageGen = newImageGenerator(imageProvider, imgCreds.apiKey, imgCreds.baseURL, imageModel);
 	}
 

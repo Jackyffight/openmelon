@@ -18,6 +18,7 @@ import type {ImageGenerator} from '../imagegen.js';
 import {Registry, type ToolDef} from './registry.js';
 import {bashTool, type ApprovalDecision, type ApprovalRequest, type BashJudgement, type BashMode} from './bash.js';
 import {registerContinuityTools} from './continuity.js';
+import {webFetchTool, webSearchTool} from './web.js';
 
 export type ToolEnv = {
 	workdir: string;
@@ -42,6 +43,8 @@ export function buildRegistry(env: ToolEnv): Registry {
 	reg.register(listLibraryTool('list_references', 'reference', 'List all reference images in this project — typically named scenes, lighting setups, or composition templates.', env));
 	reg.register(getLibraryTool('get_reference', 'reference', "Fetch a reference image's full details, including its absolute on-disk path so you can pass it to generate_image.", env));
 	reg.register(searchTool(env));
+	reg.register(webSearchTool({approve: env.approve}));
+	reg.register(webFetchTool({approve: env.approve}));
 	reg.register(readFileTool(env));
 	registerContinuityTools(reg, {workdir: env.workdir, projectId: env.project?.id ?? ''});
 	reg.register(compileSkillTool());
